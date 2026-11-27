@@ -32,6 +32,22 @@
 
 ## Current Progress, FPS & Test PC Specs
 
+> Self-assessed using the public [PortWatch VI](https://portwatch-vi.xyz/) scoring model (`50` base pts for milestones `Groundwork → Playable` + `17.5` Story + `12.5` Rendering + `10` Performance `[mean FPS ÷ 30]` + `10` Stability). Note: `VIctory-Hydra` is a self-reported community unification branch, not independently ranked on PortWatch.
+
+<p align="center">
+  <img src="docs/progress-en.svg" alt="VIctory-Hydra PortWatch-style progress tracker — 76.8%" width="100%">
+</p>
+
+### Subsystem Breakdown (Measured Locally)
+| Track | Score | Current State |
+| :--- | :--- | :--- |
+| **Milestones (`0–50%`)** | `50.0 / 50.0 pts` (`100%`) | `Groundwork` ● `Exe runs` ● `First frame` ● `Main menu` ● `In the world` ● `Playable` |
+| **Story progress (`17.5 pts`)** | `6.1 / 17.5 pts` (`35%`) | Prologue cleared; open-world gameplay & HUD active (full late-game campaign untested locally) |
+| **Rendering (`12.5 pts`)** | `9.4 / 12.5 pts` (`75%`) | Character geometry, textures, shadows, ambient reflections & HUD work; `297/298` shader tests pass |
+| **Performance (`10.0 pts`)** | `3.8 / 10.0 pts` (`37.5%`) | `11.24 FPS` 20s world mean (`11.71` median) · `13–14 FPS` live gameplay (`60.0 FPS` menus) vs `30 FPS` target |
+| **Stability (`10.0 pts`)** | `7.5 / 10.0 pts` (`75%`) | Pareto 32 GB residency + 256-shard guard locks prevent WDDM crashes; long Stage 7B endurance testing ongoing |
+| **Total** | **`76.8%`** | Bottleneck isolated: **CPU frame-prep `31–69 ms` vs RTX 3060 `8.9–17.5 ms` GPU** |
+
 ### Reference Hardware (Primary Test Rig)
 | Component | Specification |
 | :--- | :--- |

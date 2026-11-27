@@ -42,6 +42,14 @@ const EXCEPTIONS: &[(&str, &str)] = &[
         "docs/banner.jpg",
         "original project README banner artwork (no game assets or copyrighted material)",
     ),
+    (
+        "docs/progress-en.svg",
+        "original PortWatch-style progress bar SVG card for English README (pure vector XML, no game assets)",
+    ),
+    (
+        "docs/progress-ru.svg",
+        "original PortWatch-style progress bar SVG card for Russian README (pure vector XML, no game assets)",
+    ),
 ];
 
 /// Signatures of formats that must never be committed.

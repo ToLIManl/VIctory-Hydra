@@ -36,6 +36,8 @@ In any form (files, string literals, fixtures, snapshots, docs):
    open-source `crates/victory-gpu/src/launch.hlsl` using Windows SDK `dxc`.
 3. `docs/banner.jpg`: original abstract README header artwork created for this
    fork (contains zero game assets, logos, or screenshots).
+4. `docs/progress-en.svg` and `docs/progress-ru.svg`: original PortWatch-style
+   SVG progress cards rendered in the English and Russian READMEs.
 
 ## Where data lives
 
