@@ -298,7 +298,7 @@ impl HostList {
             shadow: to,
             from: scratch.map(|s| s.2 as usize),
         }));
-        deferred.title_written();
+        deferred.placed_written(dst, len, src);
         self.changed_something();
         true
     }

@@ -3334,6 +3334,33 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Active placed copies `(dst, len, src)` in this list whose destination
+    /// bytes can be forwarded directly to `src` for subsequent `Step::Fill`
+    /// reads (`VICTORY_PLACED_FORWARD`), avoiding `BEHIND_PLACED` flight stalls.
+    forward: Vec<(usize, usize, usize)>,
+}
+
+/// Whether `Step::Fill` reads covered by an earlier `Step::Placed` copy in
+/// the same list are forwarded to that copy's source (`VICTORY_PLACED_FORWARD`,
+/// on by default; `0`: off).
+pub(crate) fn placed_forward_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PLACED_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FORWARD").is_none_or(|v| v != "0"))
+}
+
+/// Fills forwarded to an earlier placed copy's source since the last frame line.
+static PLACED_FORWARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether landed host lists are recycled off the submitting thread by
+/// `victory-late-wait` when the relay is active (`VICTORY_ASYNC_RECYCLE`, on
+/// by default; `0`: inline on the submitting thread).
+fn async_recycle_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_RECYCLE").is_none_or(|v| v != "0"))
 }
 
 impl Deferred {
@@ -3352,6 +3379,55 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+        self.forward.clear();
+    }
+
+    /// Like [`Deferred::title_written`], for a placed copy of `[src, src + len)`
+    /// into `[dst, dst + len)`: invalidates any overlapping forwards and records
+    /// this non-overlapping copy for subsequent `Step::Fill` forwarding.
+    pub(super) fn placed_written(&mut self, dst: usize, len: usize, src: usize) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+        let Some(dst_end) = dst.checked_add(len) else {
+            self.forward.clear();
+            return;
+        };
+        let Some(src_end) = src.checked_add(len) else {
+            self.forward.clear();
+            return;
+        };
+        let overlaps = |a: usize, a_end: usize, b: usize, b_end: usize| a < b_end && b < a_end;
+        // Resolve chained forwarding before invalidating entries that `dst` overwrites.
+        let resolved_src = if len > 0 && !overlaps(src, src_end, dst, dst_end) {
+            Some(self.resolve_fill_src(src, len).unwrap_or(src))
+        } else {
+            None
+        };
+        self.forward.retain(|&(d, l, s)| {
+            let (d_end, s_end) = (d.saturating_add(l), s.saturating_add(l));
+            !overlaps(d, d_end, dst, dst_end) && !overlaps(s, s_end, dst, dst_end)
+        });
+        if let Some(s) = resolved_src
+            && let Some(s_end) = s.checked_add(len)
+            && !overlaps(s, s_end, dst, dst_end)
+        {
+            const MAX_FORWARDS: usize = 32;
+            if self.forward.len() >= MAX_FORWARDS {
+                self.forward.remove(0);
+            }
+            self.forward.push((dst, len, s));
+        }
+    }
+
+    /// If `[src, src + len)` lies entirely inside an active placed copy's
+    /// destination in this list, returns the corresponding source address.
+    fn resolve_fill_src(&self, src: usize, len: usize) -> Option<usize> {
+        let end = src.checked_add(len)?;
+        self.forward.iter().rev().find_map(|&(d, l, s)| {
+            let d_end = d.checked_add(l)?;
+            (src >= d && end <= d_end).then(|| s + (src - d))
+        })
     }
 }
 
@@ -4845,12 +4921,16 @@ fn late_line(frames: f64) {
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let forwarded = PLACED_FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out \
+             of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} fills forwarded (VICTORY_PLACED_FORWARD={})",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            forwarded,
+            u8::from(placed_forward_on()),
         );
     }
     card_steps::log(frames);
@@ -4942,6 +5022,39 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// `Deferred::placed_written` forwards fully covered fills to the placed
+    /// copy's source, chains non-overlapping placed copies, rejects partial or
+    /// overlapping copies, and invalidates on intervening writes.
+    #[test]
+    fn placed_copy_forwards_covered_fills_soundly() {
+        let mut d = super::Deferred::default();
+        // Basic exact and sub-range forwarding.
+        d.placed_written(0x1000, 0x190, 0x5000);
+        assert_eq!(d.resolve_fill_src(0x1000, 0x190), Some(0x5000));
+        assert_eq!(d.resolve_fill_src(0x1040, 0x80), Some(0x5040));
+        // Partial / straddling cover must NOT forward.
+        assert_eq!(d.resolve_fill_src(0x0FF0, 0x20), None);
+        assert_eq!(d.resolve_fill_src(0x1100, 0x100), None);
+        // Independent second placed copy preserves the first.
+        d.placed_written(0x2000, 0x100, 0x6000);
+        assert_eq!(d.resolve_fill_src(0x1000, 0x190), Some(0x5000));
+        assert_eq!(d.resolve_fill_src(0x2020, 0x40), Some(0x6020));
+        // Chained placed copy (0x2000.. -> 0x3000..) resolves straight to 0x6000.
+        d.placed_written(0x3000, 0x80, 0x2020);
+        assert_eq!(d.resolve_fill_src(0x3010, 0x20), Some(0x6030));
+        // Overwriting an entry's source invalidates that entry.
+        d.placed_written(0x5080, 0x40, 0x7000);
+        assert_eq!(d.resolve_fill_src(0x1000, 0x190), None);
+        assert_eq!(d.resolve_fill_src(0x5080, 0x40), Some(0x7000));
+        // Self-overlapping copy must NOT be recorded and invalidates overlaps.
+        d.placed_written(0x7010, 0x40, 0x7000);
+        assert_eq!(d.resolve_fill_src(0x7010, 0x40), None);
+        // Any general title write clears all forwards.
+        d.title_written();
+        assert_eq!(d.resolve_fill_src(0x2020, 0x40), None);
+        assert_eq!(d.resolve_fill_src(0x3010, 0x20), None);
     }
 }
 
@@ -6695,8 +6808,25 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        // With the relay active, `victory-late-wait` resets landed lists off the
+        // submitting thread when poked by `relay_land`. Keep a backpressure guard
+        // in case recycling ever falls far behind.
+        let recycle_inline = !relay() || !async_recycle_on() || {
+            let mut l = line();
+            let pending = l.landed.len();
+            if pending > 0 && pending <= 64 {
+                l.poke = true;
+                drop(l);
+                LINE_MOVED.notify_one();
+                false
+            } else {
+                pending > 64
+            }
+        };
+        if recycle_inline {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -8398,9 +8528,16 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+        let mut deferred = self.deferred();
+        let src = if placed_forward_on()
+            && let Some(fwd) = deferred.resolve_fill_src(src as usize, len)
+        {
+            PLACED_FORWARDED.fetch_add(1, Ordering::Relaxed);
+            fwd
+        } else {
+            src as usize
+        };
+        deferred.copies.push(Step::Fill(dst as usize, src, len, None));
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -8421,16 +8558,34 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        let src = if placed_forward_on()
+            && let Some(fwd) = deferred.resolve_fill_src(src as usize, len)
+        {
+            PLACED_FORWARDED.fetch_add(1, Ordering::Relaxed);
+            fwd
+        } else {
+            src as usize
+        };
+        deferred
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let mut deferred = self.deferred();
+        let src = if placed_forward_on()
+            && let Some(fwd) = deferred.resolve_fill_src(src as usize, len)
+        {
+            PLACED_FORWARDED.fetch_add(1, Ordering::Relaxed);
+            fwd
+        } else {
+            src as usize
+        };
+        deferred.copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9810,13 +9965,13 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
+        // Those known to copy nothing are filtered before `ask_ahead` and
+        // worker dispatch when the batch is modest (<= FEW), avoiding useless
+        // write-watch queries and thread wakeups on clean spans.
         const FEW: usize = 256;
         let mut spans = spans;
-        // (Renderer port #6: on the threads beside, whatever their number.)
-        let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
-        if !many {
+        let prefilter = spans.len() <= FEW;
+        if prefilter {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
@@ -9824,11 +9979,23 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
-        if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+        if spans.is_empty() && due.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return;
         }
+        let many = !prefilter;
+        let asked = if spans.len() > 1 {
+            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            if !ranges.is_empty() {
+                crate::watch::ask_ahead(&ranges);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
@@ -9845,7 +10012,7 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
-        if ahead {
+        if asked {
             crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.

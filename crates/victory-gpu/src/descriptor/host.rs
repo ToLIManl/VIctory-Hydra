@@ -2000,6 +2000,70 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// Reserves up to `want.max(slab)` consecutive free dynamic slots in a
+    /// single lock acquisition, falling back to exactly `want` if the larger
+    /// slab does not fit. Returns `(first_slot_index, reserved_count)`.
+    pub(crate) fn dynamic_slab(&self, want: u32, slab: u32) -> Option<(u32, u32)> {
+        if self.sampler || want == 0 || want > self.dynamic {
+            return None;
+        }
+        let target = want.max(slab).min(self.dynamic);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, taken) = &mut *guard;
+        let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+        let too_long = self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let end = self.dynamic as usize;
+        let try_alloc = |n: u32, taken: &[u64], cursor: usize| -> Option<usize> {
+            if free >= n && n < too_long {
+                bits::ring_run(taken, cursor, end, n as usize)
+            } else {
+                None
+            }
+        };
+        let (first, got) = if let Some(first) = try_alloc(target, taken, *next as usize) {
+            (first, target)
+        } else if target > want
+            && let Some(first) = try_alloc(want, taken, *next as usize)
+        {
+            if free >= target && target < too_long {
+                self.too_long.fetch_min(target, std::sync::atomic::Ordering::Relaxed);
+            }
+            (first, want)
+        } else {
+            if free >= want && want < too_long {
+                self.too_long.fetch_min(want, std::sync::atomic::Ordering::Relaxed);
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let largest_free = bits::largest_free_run(taken, self.dynamic as usize);
+                tracing::warn!(
+                    n = want,
+                    largest_free,
+                    free = self.free.load(std::sync::atomic::Ordering::Relaxed),
+                    capacity = self.dynamic,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicRefused, 1);
+                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            }
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        bits::fill(taken, first, first + got as usize, true);
+        self.free.fetch_sub(got, std::sync::atomic::Ordering::Relaxed);
+        *next = ((first + got as usize) % end) as u32;
+        Some((self.count + first as u32, got))
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -6417,6 +6481,27 @@ mod tests {
         assert_eq!(heap.dynamic(2), None);
     }
 
+    #[test]
+    fn dynamic_slab_reserves_chunk_and_falls_back_to_exact_want() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let (first, got) = heap.dynamic_slab(3, 256).unwrap();
+        assert_eq!((first, got), (4, 256.min(heap.dynamic)));
+        // Returning the unused tail frees it immediately for subsequent allocations.
+        heap.release(first + 3, got - 3);
+        let used = heap.dynamic(heap.dynamic - 20).unwrap();
+        assert_eq!(used, first + 3);
+        // Only 17 slots remain: asking for 8 with slab=256 falls back to exact 8.
+        let (fallback_first, fallback_got) = heap.dynamic_slab(8, 256).unwrap();
+        assert_eq!(fallback_got, 8);
+        assert!(fallback_first >= heap.count);
+        heap.release(first, 3);
+        heap.release(used, heap.dynamic - 20);
+        heap.release(fallback_first, fallback_got);
+    }
+
     /// What `HostHeap::dynamic` and `release` did with one `bool` for each slot: the model the
     /// packed bits are held to, step for step.
     struct Reference {
@@ -6630,10 +6715,19 @@ mod tests {
 
     /// `CbvMode::RawInSlot` on the host's device (WARP where no card is): a constant buffer's
     /// slot holds a raw view of its bytes, bounded as above, a null raw view where there is no
-    /// window, and nothing but its stride, address and the buffer it keeps differs from a view
-    /// made with `raw_at`; `null_raw_at` copies the null raw view made at the start.
+    /// window, and reads identically to a view made with `raw_at` (with identical descriptor bytes
+    /// on hardware drivers whose descriptors hold no internal heap pointers); `null_raw_at` copies
+    /// the null raw view made at the start.
     #[test]
     fn raw_constant_slots_hold_bounded_raw_views_in_place() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+        use windows::core::s;
+
+        let _warp_turn = crate::indirect::tests::warp_turn();
         let Some(host) = host() else {
             eprintln!("no host GPU; not run");
             return;
@@ -6642,53 +6736,168 @@ mod tests {
             eprintln!("no host descriptor heap; not run");
             return;
         };
+        // SAFETY: plain DXGI adapter query on a live device.
+        let software = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        };
         let _in_slot = crate::port_cbv::RAW_IN_SLOT_HERE.replace(Some(true));
-        let (buffer, _) = host.upload_buffer(1 << 20).expect("an upload buffer");
+        let (buffer, buf_ptr) = host.upload_buffer(1 << 20).expect("an upload buffer");
+        let dword = |byte_off: u64| 0xA000_0000u32 | (byte_off / 4) as u32;
+        // SAFETY: `upload_buffer` mapped `1 << 20` bytes.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(buf_ptr.cast::<u32>(), (1 << 20) / 4);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0xA000_0000u32 | i as u32;
+            }
+        }
         // SAFETY: a live upload buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+
+        const READ_RAW_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), UAV(u0)"
+cbuffer Offsets : register(b0) { uint o0; uint o1; uint o2; uint o3; };
+ByteAddressBuffer view : register(t0);
+RWStructuredBuffer<uint> out_words : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    out_words[0] = view.Load(o0);
+    out_words[1] = view.Load(o1);
+    out_words[2] = view.Load(o2);
+    out_words[3] = view.Load(o3);
+}
+"#;
+        let (root, pso) = {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: static shader text and entry names; out blob ours.
+            unsafe {
+                D3DCompile(
+                    READ_RAW_CS.as_ptr().cast(),
+                    READ_RAW_CS.len(),
+                    s!("read_raw"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .expect("read_raw shader must compile");
+                let code = code.unwrap();
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let (out_buf, out_ptr) = host.shared_buffer(16).expect("a shared readback buffer");
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+        let list = host.new_list().expect("a host command list");
+        let read_slot = |index: u32, offsets: [u32; 4]| -> [u32; 4] {
+            // SAFETY: open list, live heap/root/pso/buffer; `execute` waits for completion.
+            unsafe {
+                std::ptr::write_bytes(out_ptr, 0, 16);
+                let heaps = [Some(heap.heap.clone())];
+                list.list.SetDescriptorHeaps(&heaps);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRoot32BitConstants(0, 4, offsets.as_ptr().cast(), 0);
+                list.list
+                    .SetComputeRootDescriptorTable(1, heap.gpu_handle(index));
+                list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: `execute` waited for the GPU; `out_ptr` holds 4 u32s.
+            unsafe {
+                [0, 1, 2, 3].map(|i| out_ptr.cast::<u32>().add(i).read_volatile())
+            }
+        };
+
         let first = heap.dynamic(16).unwrap();
         let (slot, reference) = (first, first + 8);
-        let same_as = |slot: u32, reference: u32| {
+        let same_as = |slot: u32, reference: u32, offsets: [u32; 4], expected: [u32; 4]| {
             let (a, b) = (descriptor_bytes(&heap, slot), descriptor_bytes(&heap, reference));
             assert!(a.is_some());
-            assert_eq!(a, b);
+            assert!(b.is_some());
+            // WARP descriptors store per-creation heap pointers, so raw byte equality
+            // across independent `CreateShaderResourceView` calls only holds on hardware.
+            if !software {
+                assert_eq!(a, b);
+            }
+            assert_eq!(read_slot(slot, offsets), expected);
+            assert_eq!(read_slot(reference, offsets), expected);
         };
         // On 16 bytes, 480 bytes: 512 of them (as the constant buffer view is whole 256s).
         heap.constant_at(slot, &buffer, base + 272, 480);
         heap.raw_at(reference, &buffer, 272, 512);
-        same_as(slot, reference);
+        same_as(slot, reference, [0, 508, 512, 1024], [dword(272), dword(272 + 508), 0, 0]);
         assert!(heap.kept_in(slot).is_some(), "the slot keeps the buffer");
         // Clipped at the buffer's end.
         let near_end = (width - 112) & !15;
         let left = (width - near_end).min(512) & !3;
         heap.constant_at(slot, &buffer, base + near_end, 480);
         heap.raw_at(reference, &buffer, near_end, left);
-        same_as(slot, reference);
+        same_as(
+            slot,
+            reference,
+            [0, (left - 4) as u32, left as u32, left as u32 + 64],
+            [dword(near_end), dword(near_end + left - 4), 0, 0],
+        );
         // A constant buffer of the title's size of a megabyte: 64 KiB.
         heap.constant_at(slot, &buffer, base + 256, 1 << 20);
         heap.raw_at(reference, &buffer, 256, 64 << 10);
-        same_as(slot, reference);
+        same_as(
+            slot,
+            reference,
+            [0, (64 << 10) - 4, 64 << 10, (64 << 10) + 256],
+            [dword(256), dword(256 + (64 << 10) - 4), 0, 0],
+        );
         // Not on 16 bytes: a null raw view, not a constant buffer view or a texture's null view.
         heap.constant_at(slot, &buffer, base + 264, 480);
         heap.null_raw_at(reference);
-        same_as(slot, reference);
+        same_as(slot, reference, [0, 4, 16, 64], [0, 0, 0, 0]);
         assert!(heap.kept_in(slot).is_none(), "nothing of the buffer is shown");
         // (what `null_raw_at` copies is the null raw view `null_buffer_view` makes)
         let beside = staged(false, 1).expect("a staged slot");
         null_buffer_view(beside);
         heap.copy_from(first + 12, beside);
-        same_as(reference, first + 12);
+        same_as(reference, first + 12, [0, 4, 16, 64], [0, 0, 0, 0]);
         // The title's own size of a constant buffer in place: made, or refused for the caller to copy.
         assert!(heap.constant_raw_at(slot, &buffer, base + 4096, 480));
         heap.raw_at(reference, &buffer, 4096, 512);
-        same_as(slot, reference);
+        same_as(slot, reference, [0, 508, 512, 1024], [dword(4096), dword(4096 + 508), 0, 0]);
         assert!(heap.kept_in(slot).is_some());
         heap.null_raw_at(slot);
         assert!(!heap.constant_raw_at(slot, &buffer, base + 4100, 480), "off 16 bytes");
         assert!(!heap.constant_raw_at(slot, &buffer, base + width, 480), "past the buffer");
         assert!(!heap.constant_raw_at(slot, &buffer, base - 16, 480), "before it");
         heap.null_raw_at(reference);
-        same_as(slot, reference);
+        same_as(slot, reference, [0, 4, 16, 64], [0, 0, 0, 0]);
+        assert_eq!(descriptor_bytes(&heap, slot), descriptor_bytes(&heap, reference));
+        list.close();
         crate::port_cbv::RAW_IN_SLOT_HERE.set(None);
         heap.release(first, 16);
         // SAFETY: a plain device query.

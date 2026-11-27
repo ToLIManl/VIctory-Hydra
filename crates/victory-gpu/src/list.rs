@@ -457,7 +457,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        state.flush_slab();
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -529,8 +530,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
+            let mut state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+            state.flush_slab();
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -696,6 +698,14 @@ extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        // SAFETY: `this` is a valid `List` pointer when `host_list` succeeds.
+        unsafe {
+            (*this.cast::<List>())
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flush_slab();
+        }
         host.close();
     }
     S_OK
