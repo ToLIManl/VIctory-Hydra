@@ -92,6 +92,44 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`; `VICTORY_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+fn helpers_raised() -> bool {
+    crate::toggled!("VICTORY_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

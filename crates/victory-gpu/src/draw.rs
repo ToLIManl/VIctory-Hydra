@@ -547,12 +547,12 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-    /// Per-recorder slab of reserved dynamic slots `(title_heap, first, len, used)`
+    /// The dynamic slots the list holds: title heap, host heap id, first,
+    /// count; given back when the list has run, is reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
+    /// Per-recorder slab of reserved dynamic slots `(title_heap, host_heap_id, first, len, used)`
     /// (`VICTORY_DYNAMIC_SLAB`) to avoid per-table mutex contention on `HostHeap::next`.
-    slab: Option<(usize, u32, u32, u32)>,
+    slab: Option<(usize, u64, u32, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -579,8 +579,8 @@ const DYNAMIC_SLAB: u32 = 256;
 impl Drop for State {
     fn drop(&mut self) {
         self.flush_slab();
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -589,12 +589,12 @@ impl State {
     /// Commits the used prefix of any active per-recorder dynamic slot slab to
     /// `self.dynamic` and immediately returns its unused tail to the heap.
     pub(crate) fn flush_slab(&mut self) {
-        if let Some((heap, first, len, used)) = self.slab.take() {
+        if let Some((heap, id, first, len, used)) = self.slab.take() {
             if used > 0 {
-                self.dynamic.push((heap, first, used));
+                self.dynamic.push((heap, id, first, used));
             }
             if used < len {
-                crate::descriptor::release_dynamic(heap, first + used, len - used);
+                crate::descriptor::release_dynamic(heap, id, first + used, len - used);
             }
         }
     }
@@ -607,9 +607,11 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         n: u32,
     ) -> Option<u32> {
+        let host_id = host.id();
         if dynamic_slab_on() && n > 0 {
-            if let Some((h, first, len, used)) = &mut self.slab
+            if let Some((h, id, first, len, used)) = &mut self.slab
                 && *h == heap
+                && *id == host_id
                 && used.checked_add(n).is_some_and(|end| end <= *len)
             {
                 let out = *first + *used;
@@ -621,14 +623,14 @@ impl State {
                 crate::host::settle_for_fence();
                 host.dynamic_slab(n, DYNAMIC_SLAB)
             })?;
-            self.slab = Some((heap, first, got, n));
+            self.slab = Some((heap, host_id, first, got, n));
             return Some(first);
         }
         let first = host.dynamic(n).or_else(|| {
             crate::host::settle_for_fence();
             host.dynamic(n)
         })?;
-        self.dynamic.push((heap, first, n));
+        self.dynamic.push((heap, host_id, first, n));
         Some(first)
     }
 
@@ -648,8 +650,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -3433,8 +3435,9 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-                View::Shader(r, _) | View::Unordered(r, ..) => r,
+            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+                (ResourceType::Srv, View::Shader(r, _))
+                | (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
             };
             let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3452,19 +3455,28 @@ impl State {
             Role::Air => AIR,
             Role::Reflect => REFLECTIONS,
         };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+            once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
+        };
+        let depth = match role {
+            Role::Resolve => {
+                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    return false;
+                };
+                if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                    once!(?role, "no stand-in for the indirect light: depth dimensions differ");
+                    return false;
+                }
+                Some(depth)
+            }
+            Role::Radiance | Role::Air | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -5403,7 +5415,7 @@ mod shared_table_tests {
         let reserved = h.dynamic_capacity() - 130;
         let first = h.dynamic(reserved).unwrap();
         struct Reservation<'a>(&'a crate::descriptor::host::HostHeap, u32, u32);
-        impl Drop for Reservation<'_> { fn drop(&mut self) { self.0.release(self.1, self.2); } }
+        impl Drop for Reservation<'_> { fn drop(&mut self) { self.0.release(self.0.id(), self.1, self.2); } }
         let _reservation = Reservation(h, first, reserved);
         #[repr(C, align(256))]
         struct Constants([u32; 64]);

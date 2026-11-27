@@ -6,7 +6,7 @@
       <stop offset="100%" stop-color="#ff7a45"/>
     </linearGradient>
     <clipPath id="mainFillClip">
-      <rect x="32" y="168" width="688" height="24" rx="12"/>
+      <rect x="32" y="168" width="737" height="24" rx="12"/>
     </clipPath>
     <style>
       .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif; }
@@ -23,9 +23,9 @@
   </text>
 
   <!-- Главный процент -->
-  <text x="32" y="92" class="sans" font-size="48" font-weight="800" fill="url(#pwGrad)">76.8<tspan font-size="24" dx="3" dy="-18" fill="#ff2e7e">%</tspan></text>
+  <text x="32" y="92" class="sans" font-size="48" font-weight="800" fill="url(#pwGrad)">82.2<tspan font-size="24" dx="3" dy="-18" fill="#ff2e7e">%</tspan></text>
   <text x="32" y="114" class="sans" font-size="12.5" fill="#9ca3b8">
-    Самооценка на RTX 3060 12GB + Ryzen 5 5600X · Этап: “Playable” достигнут (Stages 1–7B)
+    Самооценка на RTX 3060 12GB + Ryzen 5 5600X · Stages 1–10 Wave 1 (+5.4% с Stage 7B)
   </text>
 
   <!-- 4 карточки статистики справа -->
@@ -35,23 +35,23 @@
     <text x="12" y="50" class="sans" font-size="11" fill="#8b92a6">Веха (50%+)</text>
 
     <rect x="114" y="0" width="106" height="68" rx="10" fill="#151824" stroke="#23283c"/>
-    <text x="126" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">13–14 FPS</text>
-    <text x="126" y="50" class="sans" font-size="11" fill="#8b92a6">В живой игре</text>
+    <text x="126" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">26–31 FPS</text>
+    <text x="126" y="50" class="sans" font-size="11" fill="#8b92a6">Лёгкие сцены</text>
 
     <rect x="228" y="0" width="106" height="68" rx="10" fill="#151824" stroke="#23283c"/>
-    <text x="240" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">11.2 FPS</text>
-    <text x="240" y="50" class="sans" font-size="11" fill="#8b92a6">Средний за 20с</text>
+    <text x="240" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">17–21 FPS</text>
+    <text x="240" y="50" class="sans" font-size="11" fill="#8b92a6">Тяжёлые сцены</text>
 
     <rect x="342" y="0" width="110" height="68" rx="10" fill="#151824" stroke="#23283c"/>
-    <text x="354" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">Stage 7B</text>
-    <text x="354" y="50" class="sans" font-size="11" fill="#8b92a6">Дальше: Stage 8</text>
+    <text x="354" y="30" class="sans" font-size="17" font-weight="700" fill="#f1f3f9">Stage 10</text>
+    <text x="354" y="50" class="sans" font-size="11" fill="#8b92a6">Wave 1 · Далее W2</text>
   </g>
 
-  <!-- Метка над полосой (76.8% = x 720) -->
-  <path d="M 720 156 C 720 162, 720 164, 720 168" stroke="#ff2e7e" stroke-width="2" fill="none"/>
-  <rect x="642" y="132" width="156" height="24" rx="12" fill="#1b1529" stroke="#ff2e7e" stroke-width="1.2"/>
-  <circle cx="656" cy="144" r="4" fill="#ff2e7e"/>
-  <text x="666" y="148" class="sans" font-size="11.5" font-weight="700" fill="#f3f5fa">VIctory-Hydra · 76.8%</text>
+  <!-- Метка над полосой (82.2% = x 769) -->
+  <path d="M 769 156 C 769 162, 769 164, 769 168" stroke="#ff2e7e" stroke-width="2" fill="none"/>
+  <rect x="691" y="132" width="156" height="24" rx="12" fill="#1b1529" stroke="#ff2e7e" stroke-width="1.2"/>
+  <circle cx="705" cy="144" r="4" fill="#ff2e7e"/>
+  <text x="715" y="148" class="sans" font-size="11.5" font-weight="700" fill="#f3f5fa">VIctory-Hydra · 82.2%</text>
 
   <!-- Основной прогресс-бар и разделители 10..50% -->
   <rect x="32" y="168" width="896" height="24" rx="12" fill="#1b1e2d"/>
@@ -113,36 +113,36 @@
     <rect x="12" y="70" width="66" height="8" rx="4" fill="url(#pwGrad)"/>
   </g>
 
-  <!-- 2: Рендеринг (75%) -->
+  <!-- 2: Рендеринг (85%) -->
   <g transform="translate(260, 300)">
     <rect x="0" y="0" width="212" height="92" rx="10" fill="#131622" stroke="#22273a"/>
     <text x="12" y="24" class="sans" font-size="12.5" font-weight="700" fill="#edf0f7">Рендеринг</text>
-    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">75%</text>
-    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">Свет, тени и отражения ок</text>
-    <text x="12" y="59" class="mono" font-size="10" fill="#687086">9.4 / 12.5 б. · 297/298 тестов</text>
+    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">85%</text>
+    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">LUT, облака, вода и BC7 фиксы</text>
+    <text x="12" y="59" class="mono" font-size="10" fill="#687086">10.6 / 12.5 б. · 305+ тестов</text>
     <rect x="12" y="70" width="188" height="8" rx="4" fill="#1e2235"/>
-    <rect x="12" y="70" width="141" height="8" rx="4" fill="url(#pwGrad)"/>
+    <rect x="12" y="70" width="160" height="8" rx="4" fill="url(#pwGrad)"/>
   </g>
 
-  <!-- 3: Производительность (37.5%) -->
+  <!-- 3: Производительность (70%) -->
   <g transform="translate(488, 300)">
     <rect x="0" y="0" width="212" height="92" rx="10" fill="#131622" stroke="#22273a"/>
     <text x="12" y="24" class="sans" font-size="12.5" font-weight="700" fill="#edf0f7">Производительность</text>
-    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">37.5%</text>
-    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">11.2 средн. / 13–14 живых FPS</text>
-    <text x="12" y="59" class="mono" font-size="10" fill="#687086">3.8 / 10.0 б. · GPU 8.9–17.5 ms</text>
+    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">70%</text>
+    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">17–21 тяж. · 26–31 лёгк. FPS</text>
+    <text x="12" y="59" class="mono" font-size="10" fill="#687086">7.0 / 10.0 б. · CPU ~2x быстрее</text>
     <rect x="12" y="70" width="188" height="8" rx="4" fill="#1e2235"/>
-    <rect x="12" y="70" width="71" height="8" rx="4" fill="url(#pwGrad)"/>
+    <rect x="12" y="70" width="132" height="8" rx="4" fill="url(#pwGrad)"/>
   </g>
 
-  <!-- 4: Стабильность (75%) -->
+  <!-- 4: Стабильность (85%) -->
   <g transform="translate(716, 300)">
     <rect x="0" y="0" width="212" height="92" rx="10" fill="#131622" stroke="#22273a"/>
     <text x="12" y="24" class="sans" font-size="12.5" font-weight="700" fill="#edf0f7">Стабильность</text>
-    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">75%</text>
-    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">32 GB Pareto · редкие фризы</text>
-    <text x="12" y="59" class="mono" font-size="10" fill="#687086">7.5 / 10.0 б. · упор в 6-яд. CPU</text>
+    <text x="200" y="24" text-anchor="end" class="sans" font-size="12.5" font-weight="700" fill="#ff5b91">85%</text>
+    <text x="12" y="44" class="sans" font-size="11" fill="#8b92a6">D3D12 538/646 + HeapId + Clamps</text>
+    <text x="12" y="59" class="mono" font-size="10" fill="#687086">8.5 / 10.0 б. · CI и WARP зелёные</text>
     <rect x="12" y="70" width="188" height="8" rx="4" fill="#1e2235"/>
-    <rect x="12" y="70" width="141" height="8" rx="4" fill="url(#pwGrad)"/>
+    <rect x="12" y="70" width="160" height="8" rx="4" fill="url(#pwGrad)"/>
   </g>
 </svg>

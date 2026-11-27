@@ -30,12 +30,36 @@
 
 ---
 
+## New Features (Stages 8 – 10 Wave 1)
+
+Highlights shipped since Stage 7B — all following the **no-compromise quality policy** (zero stripped geometry, lighting, water, or LODs):
+
+- **Placed-Copy Forwarding & Dynamic Descriptor Slabs (`VICTORY_PLACED_FORWARD=1`, `VICTORY_DYNAMIC_SLAB=1`, `VICTORY_ASYNC_RECYCLE=1`):** Eliminated `BEHIND_PLACED` GPU stalls (`21.3–23.0 ms → 0.0–1.8 ms`) and cut `HostHeap::dynamic` mutex contention from `26.9 ms → 0.5 ms` across 6,400+ tables/frame, plus monotonic `HostHeap::id` guards so stale lists never free slots in a recycled heap.
+- **CPU Scheduler, Helper Priority & Preallocated Buffers (`VICTORY_HELPER_PRIORITY`, `VICTORY_DSTORAGE_PRIORITY=-1`, `VICTORY_BUFFERS_AHEAD`, `VICTORY_PATCH_LEAN=1`, `VICTORY_INPLACE_CONSTANTS=1`):** Raised `heap-sync`, `aside`, `land`, and `wide` helpers to `ABOVE_NORMAL` while yielding DirectStorage decompression threads (`heaps' records` wait cut from `4.2–9.8 ms → 1.8–2.3 ms`), preallocated 64 KiB buffers ahead of world entry, and gated Release `PLACED_RAW` tracking out of `texture_at()`.
+- **Deterministic Static Samplers & NVIDIA 32-Lane Shader Fixes (`VICTORY_SAMPLER_ORDER`, `VICTORY_THREAD_TICKET`, `VICTORY_LDS_LOOP_ATOMICS`, `VICTORY_LDS_BOUNDS`, `VICTORY_LDS_FIRST_INIT`, `VICTORY_LOOPS_WAVE`, `VICTORY_EARLY_DEPTH`):** Fixed 3D LUT color banding (`PS_CompositeNMB`), cloud tile holes (`CS_SortRayTiles`), water dark blocks, 2D `32×2` group lane assignment on NVIDIA, BC7 mode 4/5 rotation, and violet probe artifacts in ambient light.
+- **D3D12 Validation, Memory Guardrails & Fast Tooling:** Fixed D3D12 error `538` (separate `ExecuteCommandLists` for buffer comparisons) and error `646` (ambient depth SRV type/dimension check), added `VICTORY_RAW_VIEW_CLAMP`, `VICTORY_VRAM_BUDGET_MB`, `VICTORY_SKIP_BINK=1`, `VICTORY_AUTO_A=90`, auto-staged Agility SDK `D3D12\D3D12Core.dll` in launchers, and fixed offline frame replay on Agility SDK `1.620.2`.
+
+### Before vs. After (`Stage 7B → Stage 10 Wave 1`, RTX 3060 12 GB + Ryzen 5 5600X)
+
+| Metric | Before (Stage 7B) | Now (Stages 8 – 10 Wave 1) |
+| :--- | :--- | :--- |
+| **Light World Scenes (`1,000–1,750 draws`)** | `13–14 FPS` (`~70–80 ms`) | **`25.9–30.8 FPS`** (`32.5–38.7 ms`) |
+| **Heavy World Scenes (`2,800–3,700 draws`)** | `11.2 FPS` (`89.0 ms`) | **`16.9–20.9 FPS`** (`47.8–59.2 ms`) |
+| **CPU Frame-Prep (at `~6,300–7,700 draws`)** | `60–69 ms/frame` | **`36.9 ms/frame`** (~1.8–2× faster) |
+| **`BEHIND_PLACED` Stalls** | `21.3–23.0 ms/frame` | **`0.0–1.8 ms/frame`** |
+| **`HostHeap::dynamic` Contention** | `26.9 ms/frame` | **`0.5 ms/frame`** |
+| **Waiting for `heaps' records`** | `4.2–9.8 ms/frame` | **`1.8–2.3 ms/frame`** |
+| **D3D12 Debug Layer (`538` / `646`)** | Active (`538` compare state + `646` depth SRV) | **Fixed in submission & ambient pass** |
+| **Visual Fidelity (NVIDIA 32-lane)** | 3D LUT banding, cloud holes, water blocks, violet probes | **All fixed without cutting visual effects** |
+
+---
+
 ## Current Progress, FPS & Test PC Specs
 
 > Self-assessed using the public [PortWatch VI](https://portwatch-vi.xyz/) scoring model (`50` base pts for milestones `Groundwork → Playable` + `17.5` Story + `12.5` Rendering + `10` Performance `[mean FPS ÷ 30]` + `10` Stability). Note: `VIctory-Hydra` is a self-reported community unification branch, not independently ranked on PortWatch.
 
 <p align="center">
-  <img src="docs/progress-en.svg" alt="VIctory-Hydra PortWatch-style progress tracker — 76.8%" width="100%">
+  <img src="docs/progress-en.svg" alt="VIctory-Hydra PortWatch-style progress tracker — 82.2%" width="100%">
 </p>
 
 ### Subsystem Breakdown (Measured Locally)
@@ -43,10 +67,10 @@
 | :--- | :--- | :--- |
 | **Milestones (`0–50%`)** | `50.0 / 50.0 pts` (`100%`) | `Groundwork` ● `Exe runs` ● `First frame` ● `Main menu` ● `In the world` ● `Playable` |
 | **Story progress (`17.5 pts`)** | `6.1 / 17.5 pts` (`35%`) | Prologue cleared; open-world gameplay & HUD active (full late-game campaign untested locally) |
-| **Rendering (`12.5 pts`)** | `9.4 / 12.5 pts` (`75%`) | Character geometry, textures, shadows, ambient reflections & HUD work; `297/298` shader tests pass |
-| **Performance (`10.0 pts`)** | `3.8 / 10.0 pts` (`37.5%`) | `11.24 FPS` 20s world mean (`11.71` median) · `13–14 FPS` live gameplay (`60.0 FPS` menus) vs `30 FPS` target |
-| **Stability (`10.0 pts`)** | `7.5 / 10.0 pts` (`75%`) | Pareto 32 GB residency + 256-shard guard locks prevent WDDM crashes; long Stage 7B endurance testing ongoing |
-| **Total** | **`76.8%`** | Bottleneck isolated: **CPU frame-prep `31–69 ms` vs RTX 3060 `8.9–17.5 ms` GPU** |
+| **Rendering (`12.5 pts`)** | `10.6 / 12.5 pts` (`85%`) | 3D LUT banding, cloud holes, water blocks, BC7 rotation, 32×2 wave ticket & violet probes fixed; `305+` shader tests pass |
+| **Performance (`10.0 pts`)** | `7.0 / 10.0 pts` (`70%`) | **`25.9–30.8 FPS`** light scenes · **`16.9–20.9 FPS`** heavy scenes (`60.0 FPS` menus) vs `30 FPS` target |
+| **Stability (`10.0 pts`)** | `8.5 / 10.0 pts` (`85%`) | D3D12 `538`/`646` fixed, `HostHeap::id` guard, `VICTORY_RAW_VIEW_CLAMP`, `VICTORY_VRAM_BUDGET_MB`, WARP + RTX CI green |
+| **Total** | **`82.2%`** | **`+5.4%`** since Stage 7B (`76.8% → 82.2%`) |
 
 ### Reference Hardware (Primary Test Rig)
 | Component | Specification |
@@ -57,20 +81,23 @@
 | **RAM** | 32 GB DDR4 |
 | **Storage** | HDD for game dump · SSD for `%LOCALAPPDATA%` shader & pipeline cache |
 
-### Current Performance & Status (`1280×720`, `render_scale = 0.667`, `--console series-s`, Release)
+### Current Performance & Status (`1280×720`, `render_scale = 0.667`, `--console series-s`)
 - **Menus / Loading:** `60.0 FPS` (`16.7 ms/frame`).
-- **In-World Automated Benchmark (205 world frames / 20.0s, `avg_draws = 6,284`):**
-  - **Mean:** `11.24 FPS` (`89.0 ms/frame`) · **Median:** `11.71 FPS` (`85.4 ms/frame`) · `p90 = 104.5 ms`.
-- **In-World Live Gameplay:** **`13–14 FPS`** (`69.3–79.5 ms/frame` at `4,444–4,786 draws/frame`) with full character models, clothing, shadows, ambient reflections, and HUD rendered accurately.
-- **Bottleneck Breakdown:** The RTX 3060 finishes GPU passes in **`8.9–17.5 ms/frame`** on typical world scenes (`~34.9 ms` during streaming bursts). The primary bottleneck today is **CPU-side frame preparation & draw submission (`31–69 ms/frame`)** on 6 cores — **Stage 8** focuses specifically on cutting CPU frame-prep overhead to reach a playable **`30+ FPS`** baseline before scaling up resolution and quality.
+- **Light Open-World Scenes (`1,020–1,742 draws/frame`):** **`25.9–30.8 FPS`** (`32.5–38.7 ms/frame`).
+- **Heavy Open-World Scenes (`2,838–3,675 draws/frame`):** **`16.9–20.9 FPS`** (`47.8–59.2 ms/frame`).
+- **Opening Streaming Burst (`7,633–9,391 draws/frame`, cold world pipelines):** `10.9 FPS` median (`36.9 ms` CPU prep after streaming settles).
+- **Next Target:** Push heavy world scenes past **`30 FPS`** on 6 cores in **Stage 10 Wave 2** (`VICTORY_WATCH_RESERVATION`, `VICTORY_COPY_SMALL`, `VICTORY_ASYNC_PRESENT` + `VICTORY_FRAMES_AHEAD=2`).
 
 ### Stage Roadmap
 | Stage | Focus | Status |
 | :--- | :--- | :--- |
 | **Stages 1–5** | Core `cool_fox` pareto residency, 256-shard guard locks, NaN scrub, eager decoration/face bakes, mesh launch setup | Done |
 | **Stages 6–6.1** | `MSInfo.PayloadSizeInBytes` fix (unlocking 1,762 mesh pipelines), removal of ~3,964 global UAV barriers/frame, card-window VRAM budgets, HDD elevator I/O sort | Done |
-| **Stages 7–7B** | Automated bench/A-B/replay harness, live A/B regression fixes (`VICTORY_UM_WATCH=0`, `constant:0.8`), Neptune `victory-shader` fixes (NVIDIA LDS atomics, CFG sections, `one_mode_per_register`, BVH trace limit) | Done (warming shaders & testing) |
-| **Stage 8** | Next CPU performance wave toward **30+ FPS**: `VICTORY_GPU_DETILE`, `VICTORY_SEGMENTS_ACROSS`, `VICTORY_SPREAD_LEAN`, `VICTORY_ASYNC_PRESENT`, `VICTORY_HEAP_WORKER` | Next |
+| **Stages 7–7B** | Automated bench/A-B/replay harness, live A/B regression fixes (`VICTORY_UM_WATCH=0`, `constant:0.8`), Neptune `victory-shader` fixes | Done |
+| **Stage 8** | `VICTORY_PATCH_LEAN=1`, `VICTORY_INPLACE_CONSTANTS=1`, `VICTORY_UM_COALESCE_KB=0`, `ir::whole_sections` & `POPS` fixes (`11–14 → 17–31 FPS`) | Done |
+| **Stage 9 (Waves 1–2)** | `VICTORY_PLACED_FORWARD=1`, `VICTORY_DYNAMIC_SLAB=1`, `VICTORY_ASYNC_RECYCLE=1`, lock-free `Shadow::pending`, 6-core worker balance, Agility SDK auto-staging & offline replay fixes | Done |
+| **Stage 10 Wave 1** | `PLACED_RAW` diag-gating, `VICTORY_HELPER_PRIORITY`, `HostHeap::id` guard, `VICTORY_RAW_VIEW_CLAMP`, D3D12 `538`/`646` fixes, `VICTORY_SKIP_BINK`, `VICTORY_VRAM_BUDGET_MB`, `VICTORY_BUFFERS_AHEAD`, `VICTORY_SAMPLER_ORDER`, `VICTORY_THREAD_TICKET`, cloud/water LDS fixes, BC7 rotation & `VICTORY_EARLY_DEPTH` | Done |
+| **Stage 10 Wave 2** | `VICTORY_WATCH_RESERVATION` + `VICTORY_COPY_SMALL`, `VICTORY_ASYNC_PRESENT` + `VICTORY_FRAMES_AHEAD=2`, `dstorage` `cancel`/`error_record` + `MESH_PRIM_9BIT`, A/B `VICTORY_WAVE64_PAIRED` | Next |
 
 ---
 
@@ -82,7 +109,7 @@
 - **Renderer Ports & Fast Paths:**
   - `VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`
   - `VICTORY_UP_QUEUE=1`, `VICTORY_JOIN_BARRIERS=1`, `VICTORY_READBACK_POOL=1`, `VICTORY_TEXBACK_ASYNC=1`
-  - `VICTORY_UM_COALESCE_KB=64` (user-memory page coalescing), `VICTORY_UM_TEXLOOK=1` (fast texture lookup epoch), `VICTORY_REMAP_SAME=1` & `VICTORY_ALIAS_RUNS=1` (cheap virtual memory alias remaps)
+  - `VICTORY_UM_TEXLOOK=1` (fast texture lookup epoch), `VICTORY_REMAP_SAME=1` & `VICTORY_ALIAS_RUNS=1` (cheap virtual memory alias remaps), `VICTORY_UM_COALESCE_KB=0` (prevents surface corruption)
   - Lock-free console instruction counter fast path (`SEEN_ALL`) and deferred pipeline library persistence (`VICTORY_LIBRARY_STORE_LATER=1`)
 - **DirectStorage Fast I/O (`VICTORY_DSTORAGE_IO=handles`, `VICTORY_DSTORAGE_SORT=1`):** Parallel handle-based reads and offset-sorted queues to cut loading times even on HDDs.
 

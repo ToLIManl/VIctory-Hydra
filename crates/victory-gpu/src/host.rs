@@ -844,6 +844,23 @@ pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
 
+/// The most of the card's memory taken as this process's budget, in bytes, whatever the system
+/// gives (`VICTORY_VRAM_BUDGET_MB=<n>`, 2048 at least; not given: the system's budget).
+fn vram_budget_cap() -> Option<u64> {
+    static CAP: OnceLock<Option<u64>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb = std::env::var("VICTORY_VRAM_BUDGET_MB").ok()?.trim().parse::<u64>().ok()?;
+        let mb = mb.max(2048);
+        tracing::info!(mb, "the card's memory: no more than this is taken as the budget (VICTORY_VRAM_BUDGET_MB)");
+        Some(mb << 20)
+    })
+}
+
+/// The host if it has been made (never makes it).
+pub(crate) fn host_made() -> Option<&'static Host> {
+    HOST.get().and_then(|h| h.as_ref())
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -923,6 +940,9 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // Before anything else has a static sampler (`pipeline::samplers`): the
+        // first thing made with the device, in the run as in the tools.
+        crate::pipeline::samplers::prime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -7307,9 +7327,15 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST. Buffers
+        // decay to COMMON between ExecuteCommandLists calls, so submit
+        // the compare separately before signalling this submission's fence.
+        // Keep it in the list array so the timing end markers follow it.
+        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|list| {
+            let at = lists.len();
+            lists.push(Some(list));
+            at
+        });
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -7327,21 +7353,28 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
-        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        let compare_at = if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
-        }
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
-            }
+                compare_at.map(|at| at + 1)
+            } else {
+                compare_at
+            };
+            let (lists, compare) = lists.split_at(compare_at.unwrap_or(lists.len()));
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -7349,6 +7382,9 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                if !compare.is_empty() {
+                    self.queue.ExecuteCommandLists(compare);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -7383,19 +7419,22 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        let (lists, compare) = lists.split_at(compare_at.unwrap_or(lists.len()));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
                 .iter()
+                .enumerate()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                // Include any leading timeline marker in the first timed group.
+                .map(|((i, &a), &b)| &lists[if i == 0 { 0 } else { a }..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![lists]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [lists];
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -7403,6 +7442,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && !compare.is_empty() {
+                    self.queue.ExecuteCommandLists(compare);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -7423,8 +7465,7 @@ impl Host {
                 }
             }
             self.verify_texture_readback_fence(*submitted);
-            // With timing on each group is one of `runs` (and the compare
-            // of copies in the card's memory, with the last): every
+            // With timing on each group is one of `runs`: every
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
             if timing() {
@@ -10926,6 +10967,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -10933,7 +10975,8 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -11415,7 +11458,9 @@ impl Host {
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let [own, shared] = self.sample_video_memory();
         let (own, shared) = (own?, shared?);
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        // (`VICTORY_VRAM_BUDGET_MB`: no more than that is taken as the budget)
+        let budget = vram_budget_cap().map_or(own.Budget, |cap| own.Budget.min(cap));
+        Some([budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Sample the local and non-local segments independently for the panel.
@@ -11491,6 +11536,17 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
+        if size == crate::ahead::SIZE
+            && let Some(made) = crate::ahead::shared()
+        {
+            return Some(made);
+        }
+        self.shared_buffer_now(size)
+    }
+
+    /// [`Host::shared_buffer`], made now.
+    pub(crate) fn shared_buffer_now(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
