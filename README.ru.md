@@ -116,15 +116,17 @@
 
 ### Какие зависимости нужно скачать и установить
 
-1. **DirectX 12 Agility SDK (`D3D12\D3D12Core.dll` — ОБЯЗАТЕЛЬНО на Windows 10 и старых сборках Win 11):**
-   - Без `D3D12\D3D12Core.dll` рядом с `victory.exe` библиотека `xboxbvhbuilder.dll` падает с ошибкой **`0x887e0003` (`D3D12 XDXR Error: D3D12SerializeVersionedRootSignature`)**.
-   - Скачайте пакет [`Microsoft.Direct3D.D3D12`](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12) (`1.614+`, проверено на `1.620.2`), достаньте `build\native\bin\x64\D3D12Core.dll` и положите в папку `D3D12\D3D12Core.dll` рядом с `victory.exe` (или выполните команду ниже после сборки):
+1. **DirectX 12 Agility SDK (`D3D12\D3D12Core.dll` — ОБЯЗАТЕЛЬНО, строго версия `1.620.2`):**
+   - Бинарник `victory.exe` экспортирует `D3D12SDKVersion = 620` и `D3D12SDKPath = ".\D3D12\"`. Если папки `D3D12\D3D12Core.dll` нет **рядом с запускаемым `.exe`**, либо версия ниже `1.620.x` (например `1.614`–`1.619`), либо взята не `x64`, либо скачан `1.7xx-preview` без режима разработчика Windows — система выдаст **`0x887E0003`** (*«Конфигурация версии D3D12 пакета SDK хоста exe недопустима»*) и краш `D3D12 XDXR Error: D3D12SerializeVersionedRootSignature`.
+   - Скачайте стабильный пакет [`Microsoft.Direct3D.D3D12` `1.620.2`](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2) (**не** `1.7xx-preview`), достаньте `build\native\bin\x64\D3D12Core.dll` и положите в подпапку `D3D12\D3D12Core.dll` **в ту же папку, откуда запускается `victory.exe`** (или выполните команды ниже в PowerShell):
      ```powershell
-     # Скачивает D3D12Core.dll (Agility SDK 1.620.2) в target\release\D3D12\
+     # Скачивает D3D12Core.dll (Agility SDK 1.620.2 x64) в target\release\D3D12\
      New-Item -ItemType Directory -Force "target\release\D3D12" | Out-Null
-     Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.620.2-preview" -OutFile "$env:TEMP\d3d12_agility.zip"
+     Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg" -OutFile "$env:TEMP\d3d12_agility.zip"
      Expand-Archive "$env:TEMP\d3d12_agility.zip" "$env:TEMP\d3d12_agility" -Force
      Copy-Item "$env:TEMP\d3d12_agility\build\native\bin\x64\D3D12Core.dll" "target\release\D3D12\" -Force
+     # Проверка (должно показать путь к D3D12Core.dll и ID3D12Device13 true):
+     .\target\release\victory.exe probe
      ```
 2. **Microsoft Visual C++ Redistributable 2015–2022 (x64):** нужен для `VCRUNTIME140.dll` и нативных DLL игры ([прямая ссылка](https://aka.ms/vs/17/release/vc_redist.x64.exe)).
 3. **Для сборки из исходников:**
