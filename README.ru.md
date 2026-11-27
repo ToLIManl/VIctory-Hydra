@@ -106,11 +106,45 @@
 
 ---
 
+## Требования и необходимые зависимости
+
+- **ОС:** Windows 10 (19041+) / Windows 11 x64
+- **Процессор:** x86-64 с поддержкой AVX2 (рекомендуется 6+ ядер)
+- **Видеокарта:** Direct3D 12 GPU с Shader Model 6.6 и Mesh Shaders (NVIDIA RTX 20/30/40/50 или AMD RX 6000/7000/9000; от 8 GB VRAM, для 4 GB есть отдельный батник) + свежий драйвер GPU (NVIDIA `566+` / AMD Adrenalin)
+- **ОЗУ:** рекомендуется 32 GB
+- **Файлы игры:** ваш собственный легальный дамп Xbox Series (`game_scarlett_master.exe` и архивы **вне папки репозитория**)
+
+### Какие зависимости нужно скачать и установить
+
+1. **DirectX 12 Agility SDK (`D3D12\D3D12Core.dll` — ОБЯЗАТЕЛЬНО на Windows 10 и старых сборках Win 11):**
+   - Без `D3D12\D3D12Core.dll` рядом с `victory.exe` библиотека `xboxbvhbuilder.dll` падает с ошибкой **`0x887e0003` (`D3D12 XDXR Error: D3D12SerializeVersionedRootSignature`)**.
+   - Скачайте пакет [`Microsoft.Direct3D.D3D12`](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12) (`1.614+`, проверено на `1.620.2`), достаньте `build\native\bin\x64\D3D12Core.dll` и положите в папку `D3D12\D3D12Core.dll` рядом с `victory.exe` (или выполните команду ниже после сборки):
+     ```powershell
+     # Скачивает D3D12Core.dll (Agility SDK 1.620.2) в target\release\D3D12\
+     New-Item -ItemType Directory -Force "target\release\D3D12" | Out-Null
+     Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.620.2-preview" -OutFile "$env:TEMP\d3d12_agility.zip"
+     Expand-Archive "$env:TEMP\d3d12_agility.zip" "$env:TEMP\d3d12_agility" -Force
+     Copy-Item "$env:TEMP\d3d12_agility\build\native\bin\x64\D3D12Core.dll" "target\release\D3D12\" -Force
+     ```
+2. **Microsoft Visual C++ Redistributable 2015–2022 (x64):** нужен для `VCRUNTIME140.dll` и нативных DLL игры ([прямая ссылка](https://aka.ms/vs/17/release/vc_redist.x64.exe)).
+3. **Для сборки из исходников:**
+   - **Rustup** ([rustup.rs](https://rustup.rs/)) — сам подтянет точную версию Rust из `rust-toolchain.toml`
+   - **Visual Studio 2022 Build Tools** (рабочая нагрузка *Разработка классических приложений на C++* + *Windows 10/11 SDK*)
+   - **Git**
+
+Быстрая установка всех системных зависимостей через `winget` (в PowerShell):
+```powershell
+winget install Microsoft.VCRedist.2015+.x64
+winget install Git.Git
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+---
+
 ## Быстрый старт
 
 ### 1. Сборка из исходников
-
-Нужны: Windows 10/11 x64, CPU с AVX2, GPU с D3D12 (SM 6.6 + Mesh Shaders), Rust (версия в `rust-toolchain.toml`), MSVC Build Tools (x64) и ваш собственный дамп игры **вне папки репозитория**.
 
 ```powershell
 git clone https://github.com/ToLIManl/VIctory-Hydra.git

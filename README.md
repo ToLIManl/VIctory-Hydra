@@ -106,14 +106,39 @@
 
 ---
 
-## Requirements
+## Requirements & Dependencies
 
-- **OS:** Windows 10 / 11 x64
+- **OS:** Windows 10 (19041+) / Windows 11 x64
 - **CPU:** x86-64 with AVX2 (6+ cores recommended)
-- **GPU:** Direct3D 12 GPU with Shader Model 6.6 & Mesh Shaders (NVIDIA RTX 20/30/40/50 or AMD RX 6000/7000/9000; 8 GB+ VRAM recommended, 4 GB profile included)
+- **GPU:** Direct3D 12 GPU with Shader Model 6.6 & Mesh Shaders (NVIDIA RTX 20/30/40/50 or AMD RX 6000/7000/9000; 8 GB+ VRAM recommended, 4 GB profile included) + up-to-date GPU driver (NVIDIA `566+` / AMD Adrenalin)
 - **RAM:** 32 GB recommended
-- **Build Tools:** Rust toolchain (pinned in `rust-toolchain.toml`) + Visual Studio / MSVC Build Tools (x64)
 - **Game Files:** Your own legal Xbox Series dump (`game_scarlett_master.exe` and data files stored **outside** this repository)
+
+### Required Runtime & Build Dependencies
+
+1. **DirectX 12 Agility SDK (`D3D12\D3D12Core.dll` — REQUIRED on Windows 10 & older Windows 11):**
+   - Without `D3D12\D3D12Core.dll` next to `victory.exe`, `xboxbvhbuilder.dll` fails on `D3D12SerializeVersionedRootSignature` with `0x887e0003` (`D3D12 XDXR Error`).
+   - Download [`Microsoft.Direct3D.D3D12`](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12) (`1.614+`, tested with `1.620.2`), extract `build\native\bin\x64\D3D12Core.dll`, and place it in `D3D12\D3D12Core.dll` next to `victory.exe` (or run the quick PowerShell snippet below after building):
+     ```powershell
+     # Downloads Microsoft.Direct3D.D3D12 1.620.2 into target\release\D3D12\
+     New-Item -ItemType Directory -Force "target\release\D3D12" | Out-Null
+     Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.620.2-preview" -OutFile "$env:TEMP\d3d12_agility.zip"
+     Expand-Archive "$env:TEMP\d3d12_agility.zip" "$env:TEMP\d3d12_agility" -Force
+     Copy-Item "$env:TEMP\d3d12_agility\build\native\bin\x64\D3D12Core.dll" "target\release\D3D12\" -Force
+     ```
+2. **Microsoft Visual C++ Redistributable 2015–2022 (x64):** required by `VCRUNTIME140.dll` and title DLLs ([direct download](https://aka.ms/vs/17/release/vc_redist.x64.exe)).
+3. **Build Tools (when compiling from source):**
+   - **Rustup** ([rustup.rs](https://rustup.rs/)) — automatically installs the pinned toolchain from `rust-toolchain.toml`
+   - **Visual Studio 2022 Build Tools** with *Desktop development with C++* + *Windows 10/11 SDK*
+   - **Git**
+
+Quick `winget` install for all Windows prerequisites:
+```powershell
+winget install Microsoft.VCRedist.2015+.x64
+winget install Git.Git
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
 
 ---
 
