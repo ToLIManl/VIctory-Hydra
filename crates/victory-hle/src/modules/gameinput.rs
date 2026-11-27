@@ -1404,6 +1404,41 @@ mod host {
         }
     }
 
+    /// Pure pulse schedule for `VICTORY_AUTO_A=<seconds>`: taps A for 250 ms
+    /// every 2.5 s while `elapsed_ms < limit_secs * 1000` and not cancelled by
+    /// real user input.
+    pub(super) fn auto_a_pulse(elapsed_ms: u128, limit_secs: u64, cancelled: bool) -> bool {
+        limit_secs != 0 && !cancelled && elapsed_ms < u128::from(limit_secs) * 1000 && elapsed_ms % 2500 < 250
+    }
+
+    static AUTO_A_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn auto_a_limit() -> u64 {
+        static AUTO_A: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *AUTO_A.get_or_init(|| {
+            std::env::var("VICTORY_AUTO_A")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Cancels `VICTORY_AUTO_A` once real user input is observed after the
+    /// initial boot window (15 s), so gameplay is never interrupted.
+    fn note_user_input_for_auto_a(has_input: bool) {
+        if has_input && super::START.elapsed().as_secs() >= 15 {
+            AUTO_A_CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn auto_a_active() -> bool {
+        auto_a_pulse(
+            super::START.elapsed().as_millis(),
+            auto_a_limit(),
+            AUTO_A_CANCELLED.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
@@ -1416,8 +1451,15 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            let real_pad_input = pad.buttons != 0
+                || pad.left_trigger > 0.1
+                || pad.right_trigger > 0.1
+                || pad.left_x.abs() > 0.25
+                || pad.left_y.abs() > 0.25
+                || pad.right_x.abs() > 0.25
+                || pad.right_y.abs() > 0.25;
+            note_user_input_for_auto_a(real_pad_input);
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1429,6 +1471,9 @@ mod host {
                         pad.buttons |= button;
                     }
                 }
+            }
+            if slot == 0 && auto_a_active() {
+                pad.buttons |= A;
             }
             Some(pad)
         }
@@ -1446,23 +1491,14 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                note_user_input_for_auto_a(!held.is_empty());
                 down.extend(held);
             }
-            // (Neptune) `VICTORY_AUTO_A=<seconds>`: taps Enter (stand-in pad A) for
-            // 250 ms every 4 s during boot/menus even without focus, so unattended
-            // benchmark runs advance straight into gameplay.
-            static AUTO_A: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let auto_a = *AUTO_A.get_or_init(|| {
-                std::env::var("VICTORY_AUTO_A")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0)
-            });
-            if auto_a != 0 {
-                let run = super::START.elapsed();
-                if run.as_secs() < auto_a && run.as_millis() % 4000 < 250 && !down.contains(&0x0D) {
-                    down.push(0x0D);
-                }
+            // `VICTORY_AUTO_A=<seconds>`: taps Enter (stand-in pad A) and pad 0 A
+            // for 250 ms every 2.5 s during boot/menus even without focus, and
+            // stops automatically once real user input is seen after 15 s.
+            if auto_a_active() && !down.contains(&0x0D) {
+                down.push(0x0D);
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -2257,5 +2293,17 @@ mod tests {
         host.lock().unwrap().pads[0] = None;
         hub.poll();
         assert_eq!(host.lock().unwrap().mouse_active_log.last(), Some(&true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_a_pulse_schedule_and_cancel() {
+        assert!(!host::auto_a_pulse(0, 0, false));
+        assert!(host::auto_a_pulse(0, 90, false));
+        assert!(host::auto_a_pulse(249, 90, false));
+        assert!(!host::auto_a_pulse(250, 90, false));
+        assert!(host::auto_a_pulse(2500, 90, false));
+        assert!(!host::auto_a_pulse(90_000, 90, false));
+        assert!(!host::auto_a_pulse(100, 90, true));
     }
 }
