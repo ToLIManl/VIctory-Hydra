@@ -1057,6 +1057,141 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Opt-in reservation-grouped `ask_once` (`VICTORY_WATCH_RESERVATION=1`; off by
+/// default): queries `QueryVirtualMemoryInformation` for reservation boundaries
+/// (`AllocationBase + RegionSize`) so `GetWriteWatch` spans stay inside one
+/// private reservation instead of crossing boundaries and binary-splitting.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1"))
+}
+
+/// Queries the VirtualAlloc reservation end (in 64 KiB pages) and whether the
+/// region is `Private` (write-watched) rather than a mapped section view.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query takes an address as input and fills our structure.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: the successful query filled the flags; bit zero is Private.
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Joins neighbouring pieces within one reservation when the gap is within the
+/// configured limit (or smaller than the smaller neighbour).
+fn can_join(first: usize, last: usize, (start, end): (usize, usize), ahead_gap: usize, ahead_max: usize) -> bool {
+    last.max(end) - first <= ahead_max
+        && start.saturating_sub(last) <= ahead_gap.max((last - first).min(end - start))
+}
+
+/// Keeps only the requested pieces (merging touching pieces from the same
+/// kernel call) so unrequested gaps stay uncached while their writes are still
+/// journalled.
+fn keep_requested(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
+    let mut same_call = false;
+    for &(start, end) in pieces {
+        if let Some((_, last)) = ahead.last_mut() {
+            if end <= *last {
+                continue;
+            }
+            if same_call && start <= *last {
+                *last = end;
+                continue;
+            }
+        }
+        ahead.push((start, end));
+        same_call = true;
+    }
+}
+
+/// Reservation-grouped `ask_once`: splits sorted pieces by reservation boundary,
+/// asks private reservations in parallel via `spread_each`, records all written
+/// pages (including holes), and caches only the requested pieces in `ahead`.
+fn ask_reservations_held(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.sort_unstable();
+    let (ahead_gap, ahead_max) = ahead_limits();
+    let mut groups: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
+    let mut allocation: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while i < pieces.len() {
+        let (first, end) = pieces[i];
+        if allocation.is_none_or(|(limit, _)| first >= limit) {
+            let neighbour = pieces
+                .get(i + 1)
+                .is_some_and(|&next| can_join(first, end, next, ahead_gap, ahead_max));
+            allocation = if neighbour || known_views(first, end) {
+                reservation(first)
+            } else {
+                None
+            };
+        }
+        let (limit, private) = allocation.unwrap_or((end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = pieces.get(i + n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next, ahead_gap, ahead_max) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        if private {
+            groups.push((first, last, i..i + n));
+        }
+        i += n;
+    }
+    let answers = spread_each(groups.len(), |g| {
+        let (first, last, _) = groups[g];
+        kernel_written(first, last)
+    });
+    let mut ahead = Vec::new();
+    let mut written = Vec::new();
+    for ((_, _, slice), found) in groups.into_iter().zip(answers) {
+        if let Some(pages) = found {
+            written.extend(pages);
+            keep_requested(&mut ahead, &pieces[slice]);
+        }
+    }
+    note_hot(&written);
+    if port_journal() {
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !pieces.is_empty();
+        j.ahead.set(ahead);
+        return;
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.notes.note(page, parts, now);
+    }
+    j.kept = !pieces.is_empty();
+    j.ahead.set(ahead);
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -1070,6 +1205,11 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
+    if by_reservation() {
+        ask_reservations_held(ranges);
+        spent.end();
+        return;
+    }
     ask_ahead_held(ranges, true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
@@ -3740,6 +3880,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::shadow::write_combined_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {

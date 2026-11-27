@@ -241,6 +241,21 @@ pub(crate) struct HostHeap {
     stale_at: Vec<std::sync::atomic::AtomicU32>,
     /// FIFO of `(slot, tick, key)` kept stale past their view, expired at `VICTORY_STALE_KEEP_MAX_MS`.
     stale_line: Mutex<std::collections::VecDeque<(u32, u32, u64)>>,
+    /// Slots that may currently be in `placed` (`VICTORY_SPANS_QUICK=1`):
+    /// writes of non-placed views skip locking `placed` when their bit is clear.
+    spanned: Slots,
+}
+
+/// Whether a slot's write of a non-placed view skips locking `placed` when the
+/// slot is not tracked in `spanned` (`VICTORY_SPANS_QUICK=1`; on by default,
+/// `=0` restores taking `placed`'s lock on every write).
+fn spans_quick() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SPANS_QUICK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_none_or(|v| v != "0"))
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1961,6 +1976,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             stale_line: Mutex::default(),
+            spanned: Slots::new((count + extra) as usize),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -3198,7 +3214,16 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let in_spans = |index: u32| {
+            let bit = 1u64 << (index % 64);
+            self.spanned
+                .0
+                .get(index as usize / 64)
+                .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        let stale = if placed_view.is_none() && !in_spans(index) && spans_quick() {
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -3209,6 +3234,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.spanned.put(index);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -3217,6 +3243,7 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    self.spanned.remove(index);
                     Vec::new()
                 }
             }

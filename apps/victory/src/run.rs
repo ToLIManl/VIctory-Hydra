@@ -36,6 +36,188 @@ fn check_cpu_features() -> Result<()> {
 }
 
 #[cfg(windows)]
+fn apply_menu_settings() {
+    use std::path::PathBuf;
+
+    // Automated benchmarks stay isolated from interactive F1 settings.
+    if std::env::var_os("VICTORY_BENCH_WORLD_S").is_some() {
+        return;
+    }
+
+    let path = std::env::var_os("VICTORY_MENU_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("victory-settings.txt")))
+        });
+    let Some(path) = path else { return };
+    // SAFETY: single-threaded startup before any worker threads are spawned.
+    unsafe {
+        if std::env::var_os("VICTORY_MENU_FILE").is_none() {
+            std::env::set_var("VICTORY_MENU_FILE", &path);
+        }
+    }
+
+    let mut saved: Vec<(String, String)> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if k.starts_with("VICTORY_") {
+                    saved.push((k.to_owned(), v.to_owned()));
+                }
+            }
+        }
+        if !saved.is_empty() {
+            println!("settings       loaded {} override(s) from {}", saved.len(), path.display());
+        }
+    }
+
+    let find_saved = |key: &str| {
+        saved
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+
+    // Apply direct layer switches first.
+    // SAFETY: single-threaded startup.
+    unsafe {
+        for (k, v) in &saved {
+            if k.starts_with("VICTORY_MENU_") {
+                continue;
+            }
+            if v.is_empty() {
+                std::env::remove_var(k);
+            } else {
+                std::env::set_var(k, v);
+            }
+        }
+
+        if let Some(dlss) = find_saved("VICTORY_MENU_DLSS") {
+            match dlss.to_ascii_lowercase().as_str() {
+                "off" => {
+                    std::env::set_var("VICTORY_DLSS", "0");
+                }
+                mode @ ("quality" | "balanced" | "performance" | "ultraperformance" | "dlaa") => {
+                    std::env::set_var("VICTORY_DLSS", "1");
+                    std::env::set_var("VICTORY_DLSS_MODE", mode);
+                }
+                _ => {}
+            }
+        }
+
+        let fg_type = find_saved("VICTORY_MENU_FG_TYPE").map(str::to_ascii_lowercase);
+        if let Some(kind) = fg_type.as_deref() {
+            match kind {
+                "fsr" => {
+                    std::env::set_var("VICTORY_FRAMEGEN", "0");
+                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                }
+                "dlss" => {
+                    std::env::set_var("VICTORY_FRAMEGEN", "1");
+                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "0");
+                }
+                "auto" => {
+                    std::env::set_var("VICTORY_FRAMEGEN", "1");
+                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(fg) = find_saved("VICTORY_MENU_FRAMEGEN") {
+            let n: u32 = fg.parse().unwrap_or(0);
+            std::env::set_var("VICTORY_FRAMEGEN_X", n.to_string());
+            if n == 0 {
+                // Keep FSR3 / DLSS FG ready so the F1 menu can switch it back on LIVE.
+                if std::env::var_os("VICTORY_FSR_FRAMEGEN").is_none()
+                    && std::env::var_os("VICTORY_FIDELITYFX_DIR").is_some()
+                {
+                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                }
+            } else if fg_type.is_none() {
+                if std::env::var_os("VICTORY_FIDELITYFX_DIR").is_some() {
+                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                }
+                if std::env::var_os("VICTORY_STREAMLINE_DIR").is_some() {
+                    std::env::set_var("VICTORY_FRAMEGEN", "1");
+                }
+            }
+        }
+
+        if let Some(out) = find_saved("VICTORY_MENU_OUTPUT")
+            && !out.is_empty()
+        {
+            std::env::set_var("VICTORY_OUTPUT", out);
+        }
+
+        if let Some(fps) = find_saved("VICTORY_MENU_FPS") {
+            match fps {
+                "0" | "1000" => std::env::set_var("VICTORY_FRAME_INTERVAL_MS", "0"),
+                "30" => std::env::set_var("VICTORY_FRAME_INTERVAL_MS", "33.333"),
+                "60" => std::env::set_var("VICTORY_FRAME_INTERVAL_MS", "16.667"),
+                "120" => std::env::set_var("VICTORY_FRAME_INTERVAL_MS", "8.333"),
+                _ => {}
+            }
+        }
+
+        // Sync effective runtime values into VICTORY_MENU_* so F1 shows accurate active state.
+        let dlss_on = std::env::var("VICTORY_DLSS").is_ok_and(|v| v == "1");
+        let dlss_val = if dlss_on {
+            std::env::var("VICTORY_DLSS_MODE").unwrap_or_else(|_| "quality".to_owned())
+        } else {
+            "off".to_owned()
+        };
+        std::env::set_var("VICTORY_MENU_DLSS", dlss_val);
+
+        let fsr_on = std::env::var("VICTORY_FSR_FRAMEGEN").is_ok_and(|v| v == "1");
+        let dlss_fg_on = std::env::var("VICTORY_FRAMEGEN").is_ok_and(|v| v == "1");
+        let fg_x = if fsr_on || dlss_fg_on {
+            std::env::var("VICTORY_FRAMEGEN_X").unwrap_or_else(|_| "2".to_owned())
+        } else {
+            "0".to_owned()
+        };
+        std::env::set_var("VICTORY_MENU_FRAMEGEN", fg_x);
+
+        let fg_kind = match (dlss_fg_on, fsr_on) {
+            (true, false) => "dlss",
+            (false, true) => "fsr",
+            _ => "auto",
+        };
+        std::env::set_var("VICTORY_MENU_FG_TYPE", fg_kind);
+
+        if let Ok(out) = std::env::var("VICTORY_OUTPUT") {
+            std::env::set_var("VICTORY_MENU_OUTPUT", out);
+        }
+        let fps_val = match std::env::var("VICTORY_FRAME_INTERVAL_MS").as_deref() {
+            Ok("0") => "0",
+            Ok(v) if v.starts_with("33") => "30",
+            Ok(v) if v.starts_with("16") => "60",
+            Ok(v) if v.starts_with("8.") => "120",
+            _ => "0",
+        };
+        std::env::set_var("VICTORY_MENU_FPS", fps_val);
+        if std::env::var_os("VICTORY_FPS_LINE").is_none() {
+            std::env::set_var("VICTORY_FPS_LINE", "1");
+        }
+        if std::env::var_os("VICTORY_PANEL").is_none() {
+            std::env::set_var("VICTORY_PANEL", "0");
+        }
+        if std::env::var_os("VICTORY_WATER_LIGHT").is_none() {
+            std::env::set_var("VICTORY_WATER_LIGHT", "0");
+        }
+    }
+}
+
+#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -52,7 +234,40 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    apply_menu_settings();
     let cfg = victory_core::Config::load()?;
+    // DLSS Super Resolution & DLSS / AMD FSR 3 Frame Generation (`VICTORY_DLSS`,
+    // `VICTORY_FRAMEGEN`, `VICTORY_FSR_FRAMEGEN`): initialized before the host
+    // GPU and fails soft if DLLs or GPU features are missing.
+    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    asked.series_s = matches!(console, Console::SeriesS);
+    let available = victory_hle::streamline::init(&asked);
+    for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
+        println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
+    }
+    if asked.any() || asked.fsr_framegen {
+        println!(
+            "upscaling      DLSS {}, DLSS FG {}, FSR 3 FG {} (mode: {} scale {:.3})",
+            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
+            if available.fsr_framegen { "on" } else if asked.fsr_framegen { "asked, not available" } else { "off" },
+            asked.mode.name(),
+            asked.mode.scale(),
+        );
+    }
+    if available.dlss || available.framegen || available.fsr_framegen {
+        // Ensure the title takes the FidelityFX upscaler path (7) so our
+        // interposer receives its upscale dispatches for DLSS SR and depth/MV
+        // inputs for frame generation, and match render scale to DLSS mode
+        // unless the user explicitly forced a custom render scale.
+        // SAFETY: single-threaded startup before title execution.
+        unsafe {
+            std::env::set_var("VICTORY_UPSCALER", "7");
+            if std::env::var_os("VICTORY_RENDER_SCALE").is_none() || available.dlss {
+                std::env::set_var("VICTORY_RENDER_SCALE", format!("{:.4}", asked.mode.scale()));
+            }
+        }
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -150,6 +365,7 @@ pub fn run(
     // VICTORY_SKIP_BINK asks for it (bound as before otherwise); beneath
     // the FidelityFX interposer, which only looks at its own DLL.
     let with_dlls = victory_hle::modules::bink::SkipMovies { inner: &with_dlls };
+    let with_dlls = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -444,9 +660,9 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
-                // As at startup: Bink imports of DLLs loaded later too
-                // (VICTORY_SKIP_BINK; bound as before otherwise).
+                // As at startup: Bink imports and FidelityFX imports of DLLs loaded later too.
                 let resolver = victory_hle::modules::bink::SkipMovies { inner: &resolver };
+                let resolver = victory_hle::modules::fidelityfx::Interpose { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

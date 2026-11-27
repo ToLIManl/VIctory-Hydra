@@ -21,12 +21,14 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod error_record;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, Weak};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -149,12 +151,12 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = File::object(files, &kept, *RETAIN_FILE);
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    // Only the walls trace reads the list, so it isn't kept without it.
-    if walls_trace() > 0 {
+    // Keep file names for walls trace or error record retrieval.
+    if walls_trace() > 0 || error_record::enabled() {
         WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     }
     put(out, file)
@@ -220,12 +222,22 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let mut lane = Lane::new(desc.priority, desc.capacity);
+    if error_record::enabled() {
+        let Some(record) = error_record::Errors::new() else {
+            return E_OUTOFMEMORY;
+        };
+        lane.errors = Some(Arc::new(record));
+    }
+    let errors = lane.errors.clone();
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", queue_table()),
+            Queue { id, errors },
+        ),
     )
 }
 
@@ -278,8 +290,60 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 // Files.
 
-struct File {
+/// Approach after XCL c8e3ca0: a submitted file source must belong to this
+/// factory and remain readable until its worker finishes. Look up the
+/// opaque object address at enqueue without reading through a guest pointer.
+static RETAIN_FILE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VICTORY_DSTORAGE_FILE_SOURCE").is_some_and(|v| v == "1"));
+static OPEN_FILES: Mutex<BTreeMap<usize, Weak<Opened>>> = Mutex::new(BTreeMap::new());
+const E_FILE_HANDLE: HRESULT = 0x8924_0017u32 as i32;
+
+struct Opened {
     files: Files,
+    name: String,
+}
+
+struct File {
+    file: Arc<Opened>,
+    registered: bool,
+}
+
+impl File {
+    fn object(files: Files, name: &str, registered: bool) -> *mut c_void {
+        let file = Arc::new(Opened {
+            files,
+            name: if registered {
+                name.to_owned()
+            } else {
+                String::new()
+            },
+        });
+        let weak = registered.then(|| Arc::downgrade(&file));
+        let object = Instance::create(
+            Object::new("dstorage file", &FILE_VTABLE),
+            Self { file, registered },
+        );
+        if let Some(weak) = weak {
+            OPEN_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(object.addr(), weak);
+        }
+        object
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        if self.registered {
+            let object =
+                std::ptr::from_ref(self).addr() - std::mem::offset_of!(Instance<File>, state);
+            OPEN_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&object);
+        }
+    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -537,6 +601,7 @@ static STATUS_VTABLE: Methods<5> = Methods([
 /// A queue object: its lane in the scheduler.
 struct Queue {
     id: u64,
+    errors: Option<Arc<error_record::Errors>>,
 }
 
 impl Drop for Queue {
@@ -601,6 +666,7 @@ struct Lane {
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
+    errors: Option<Arc<error_record::Errors>>,
     closed: bool,
 }
 
@@ -614,6 +680,8 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    pages: PageList,
+    file: Result<Option<Arc<Opened>>, HRESULT>,
     note: Note,
     staging: u64,
 }
@@ -824,7 +892,7 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = job.execute();
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -886,14 +954,14 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (_, read) = lane.reads.front()?;
+        let staging = staging_bytes(&read.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, pages, file, note }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -905,6 +973,8 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            pages,
+            file,
             note,
             staging,
         })
@@ -916,6 +986,15 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                if let Some(errors) = &lane.errors {
+                    let name = job
+                        .file
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .map(|f| f.name.as_str());
+                    errors.note(&job.request, hr, name);
+                }
             }
             lane.flush();
         }
@@ -1047,8 +1126,19 @@ impl Lane {
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
+            errors: None,
             closed: false,
         }
+    }
+
+    /// Approach after XCL 66660bd: cancellation removes matching reads that
+    /// have not started, including ones that would fail validation. Status
+    /// entries after them can complete as soon as earlier running reads end.
+    fn cancel(&mut self, mask: u64, value: u64) {
+        self.unsubmitted
+            .retain(|cmd| !matches!(cmd, Command::Read(r) if r.request.tag & mask == value));
+        self.reads.retain(|(_, r)| r.request.tag & mask != value);
+        self.flush();
     }
 
     /// Requests and status entries held, submitted or not.
@@ -1159,10 +1249,130 @@ enum Command {
 }
 
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
+/// Approach after XCL bb27ed6: a title can replace a heap page list before
+/// submission. A list on the enqueuing thread's stack can disappear as soon
+/// as enqueue returns. The worker needs ownership in either case.
 struct Read {
     request: Request,
+    pages: PageList,
+    file: Result<Option<Arc<Opened>>, HRESULT>,
     note: Note,
+}
+
+enum PageList {
+    Legacy,
+    Stack(Result<Vec<usize>, HRESULT>),
+    Deferred,
+}
+
+impl Read {
+    fn new(request: Request, note: Note, own_pages: bool, retain_file: bool) -> Self {
+        let pages = if own_pages && request.options & PAGE_DESTINATION != 0 {
+            let (mut low, mut high) = (0, 0);
+            // SAFETY: both outputs belong to this call.
+            unsafe {
+                windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(
+                    &mut low, &mut high,
+                )
+            };
+            if (low..high).contains(&(request.destination as usize)) {
+                PageList::Stack(Self::read_pages(&request))
+            } else {
+                PageList::Deferred
+            }
+        } else {
+            PageList::Legacy
+        };
+        let file = if retain_file && request.options & MEMORY_SOURCE == 0 {
+            OPEN_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&request.source.addr())
+                .and_then(Weak::upgrade)
+                .map(Some)
+                .ok_or(E_FILE_HANDLE)
+        } else {
+            Ok(None)
+        };
+        Self {
+            request,
+            pages,
+            file,
+            note,
+        }
+    }
+
+    fn read_pages(raw: &Request) -> Result<Vec<usize>, HRESULT> {
+        use windows_sys::Win32::System::{
+            Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess,
+        };
+        let length = if raw.options & (ZLIB | BCPACK) == 0 {
+            raw.source_size.min(raw.destination_size)
+        } else {
+            raw.destination_size
+        };
+        let count = ((raw.page_offset as usize & (PAGE - 1)) + length as usize).div_ceil(PAGE);
+        let mut pages = vec![0usize; count];
+        let bytes = count * size_of::<usize>();
+        let mut read = 0;
+        // SAFETY: the kernel checks the title's range, including a deferred
+        // list whose allocation was released. The output is ours.
+        if bytes != 0
+            && unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    raw.destination,
+                    pages.as_mut_ptr().cast(),
+                    bytes,
+                    &mut read,
+                )
+            } == 0
+            || read != bytes
+        {
+            return Err(E_INVALIDARG);
+        }
+        Ok(pages)
+    }
+
+    fn execute_parts(
+        raw: &Request,
+        pages: &PageList,
+        file: &Result<Option<Arc<Opened>>, HRESULT>,
+    ) -> Result<(), HRESULT> {
+        let files = file
+            .as_ref()
+            .map_err(|hr| *hr)?
+            .as_ref()
+            .map(|f| &f.files);
+        let fetched;
+        let pages = match pages {
+            PageList::Legacy => return execute(raw, files),
+            PageList::Stack(saved) => saved.as_ref().map_err(|hr| *hr)?,
+            PageList::Deferred => {
+                fetched = Self::read_pages(raw)?;
+                &fetched
+            }
+        };
+        if raw.destination.is_null() {
+            return Err(E_INVALIDARG);
+        }
+        let request = Request {
+            destination: pages.as_ptr().cast_mut().cast(),
+            ..*raw
+        };
+        execute(&request, files)
+    }
+
+    #[cfg(test)]
+    fn execute(&self) -> Result<(), HRESULT> {
+        Self::execute_parts(&self.request, &self.pages, &self.file)
+    }
+}
+
+impl Job {
+    fn execute(&self) -> Result<(), HRESULT> {
+        Read::execute_parts(&self.request, &self.pages, &self.file)
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1388,8 +1598,14 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
+    static OWN: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_DSTORAGE_PAGE_LIST").is_some_and(|v| v == "1")
+    });
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(
+        this,
+        Command::Read(Read::new(request, note, *OWN, *RETAIN_FILE)),
+    );
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1638,7 +1854,7 @@ impl std::ops::Deref for DecodedSource {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, file: Option<&Files>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1667,11 +1883,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, size, |out| read_into(request, out, file).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, file).map_err(|hr| fail(hr, "reading the source"))?;
     let _decode_permit = acquire_decode_permit();
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
@@ -1788,7 +2004,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file into a reused thread-local scratch buffer.
-fn read_source(request: &Request) -> Result<SourceBytes, HRESULT> {
+fn read_source(request: &Request, file: Option<&Files>) -> Result<SourceBytes, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1796,7 +2012,7 @@ fn read_source(request: &Request) -> Result<SourceBytes, HRESULT> {
         return Ok(SourceBytes::Borrowed(bytes));
     }
     let mut bytes = ScratchBuf::take(&SRC_SCRATCH, size);
-    read_into(request, &mut bytes)?;
+    read_into(request, &mut bytes, file)?;
     Ok(SourceBytes::Scratch(bytes))
 }
 
@@ -1807,16 +2023,19 @@ static READING: AtomicU64 = AtomicU64::new(0);
 const READ_RETRIES: u32 = 8;
 
 /// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+fn read_into(request: &Request, out: &mut [u8], file: Option<&Files>) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .files;
+    let files = file.unwrap_or_else(|| {
+        // SAFETY: a file object we created; the title keeps it open.
+        &unsafe { &*request.source.cast::<Instance<File>>() }
+            .state
+            .file
+            .files
+    });
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
@@ -2006,20 +2225,45 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
-    missing::<0> as *const (),
-    add_ref_instance::<Queue> as *const (),
-    release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
-]);
+fn queue_table() -> &'static Methods<12> {
+    static CANCEL: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_DSTORAGE_CANCEL").is_some_and(|v| v == "1")
+    });
+    static TABLES: [Methods<12>; 4] = [
+        methods(false, false),
+        methods(true, false),
+        methods(false, true),
+        methods(true, true),
+    ];
+    &TABLES[usize::from(*CANCEL) + 2 * usize::from(error_record::enabled())]
+}
+
+extern "system" fn cancel(this: QueueRef, mask: u64, value: u64) {
+    let Some(scheduler) = scheduler() else { return };
+    let id = unsafe { &*this }.state.id;
+    if let Some(lane) = scheduler.lock().lanes.get_mut(&id) {
+        lane.cancel(mask, value);
+    }
+    scheduler.work.notify_all();
+    scheduler.finished.notify_all();
+}
+
+const fn methods(cancel_reads: bool, errors: bool) -> Methods<12> {
+    Methods([
+        missing::<0> as *const (),
+        add_ref_instance::<Queue> as *const (),
+        release::<Queue> as *const (),
+        enqueue_request as *const (), // 0x18
+        enqueue_status as *const (),  // 0x20
+        missing::<5> as *const (),    // 0x28 (2020: fence signal)
+        submit as *const (),          // 0x30
+        if cancel_reads { cancel as *const () } else { missing::<7> as *const () },
+        close as *const (),           // 0x40
+        if errors { error_record::event as *const () } else { missing::<9> as *const () },
+        if errors { error_record::retrieve as *const () } else { missing::<10> as *const () },
+        missing::<11> as *const (),   // 0x58 (2020: queue info)
+    ])
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -2384,7 +2628,7 @@ mod tests {
             protect(PAGE_READWRITE)
         });
         let r = request(0, at as *mut c_void, plain.len(), file, 0, plain.len());
-        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(execute(&r, None), Ok(()));
         assert_ne!(opener.join().unwrap(), 0);
         // SAFETY: as above, all of it readable.
         assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
@@ -2494,7 +2738,101 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted
+            .push(Command::Read(Read::new(r, note, false, false)));
+    }
+
+    #[test]
+    fn a_queued_file_read_survives_release_and_rejects_unknown_objects() {
+        use std::io::Write;
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&[11, 28]).unwrap();
+        let files = Files::new(source, Io::One);
+        let object = File::object(files, "input.bin", true);
+        let mut byte = 0u8;
+        let raw = request(0, std::ptr::from_mut(&mut byte).cast(), 1, object, 1, 1);
+        let read = Read::new(raw, Note::default(), false, true);
+        assert_eq!(release(object.cast::<Instance<File>>()), 0);
+        read.execute().unwrap();
+        assert_eq!(byte, 28);
+        assert_eq!(
+            Read::new(raw, Note::default(), false, true).execute(),
+            Err(E_FILE_HANDLE)
+        );
+        let foreign = Request {
+            source: std::ptr::dangling::<u8>().cast(),
+            ..raw
+        };
+        assert_eq!(
+            Read::new(foreign, Note::default(), false, true).execute(),
+            Err(E_FILE_HANDLE)
+        );
+    }
+
+    #[test]
+    fn queued_page_lists_keep_stack_entries_and_observe_replaced_heap_entries() {
+        use crate::modules::xmem;
+        let mut physical = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, physical.as_mut_ptr()),
+            1
+        );
+        let bytes = [17u8, 39];
+        let make = |list: &mut usize, src: &u8| {
+            Read::new(
+                request(
+                    PAGE_DESTINATION | MEMORY_SOURCE,
+                    std::ptr::from_mut(list).cast(),
+                    1,
+                    std::ptr::from_ref(src).cast(),
+                    0,
+                    1,
+                ),
+                Note::default(),
+                true,
+                false,
+            )
+        };
+        let mut stack = physical[0];
+        let mut heap = Box::new(physical[0]);
+        let from_stack = make(&mut stack, &bytes[0]);
+        let from_heap = make(&mut heap, &bytes[1]);
+        stack = physical[1];
+        *heap = stack;
+        from_stack.execute().unwrap();
+        from_heap.execute().unwrap();
+        for (&page, expected) in physical.iter().zip(bytes) {
+            assert_eq!(
+                xmem::page_window(&[page], 0, 1).unwrap().bytes(),
+                &[expected]
+            );
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(2, physical.as_ptr()), 1);
+    }
+
+    #[test]
+    fn cancellation_covers_pending_and_submitted_reads_but_has_no_effect_on_later_enqueues() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 20));
+        for tag in [0xa0, 0xb0] {
+            read(&mut l, 0, 1 << 40, 4);
+            if let Command::Read(r) = l.lanes.get_mut(&0).unwrap().unsubmitted.last_mut().unwrap() {
+                r.request.tag = tag;
+            }
+            l.submit(0, false);
+        }
+        read(&mut l, 0, 0, 4);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        if let Command::Read(r) = &mut lane.unsubmitted[0] {
+            r.request.tag = 0xa1;
+        }
+        lane.cancel(0xf0, 0xa0);
+        assert!(lane.unsubmitted.is_empty());
+        assert_eq!(lane.reads.len(), 1);
+        assert_eq!(lane.reads[0].1.request.tag, 0xb0);
+        read(&mut l, 0, 0, 4);
+        assert_eq!(l.lanes[&0].unsubmitted.len(), 1);
     }
 
     #[test]
@@ -2875,8 +3213,8 @@ mod tests {
     #[test]
     fn hdd_batch_sort_orders_file_reads_without_crossing_status_or_overlaps() {
         let mk_read = |file: usize, offset: u64, dst: usize, size: u32, options: u64| {
-            Command::Read(Read {
-                request: Request {
+            Command::Read(Read::new(
+                Request {
                     options,
                     destination: dst as *mut c_void,
                     page_offset: 0,
@@ -2888,8 +3226,10 @@ mod tests {
                     tag: 0,
                     name: std::ptr::null(),
                 },
-                note: Note::default(),
-            })
+                Note::default(),
+                false,
+                false,
+            ))
         };
         let status = Command::Status(Status {
             array: std::ptr::null_mut(),

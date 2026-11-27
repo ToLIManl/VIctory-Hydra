@@ -29,6 +29,9 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+/// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
+#[cfg(windows)]
+pub use victory_gpu::streamline;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;

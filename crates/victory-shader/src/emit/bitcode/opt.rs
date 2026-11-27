@@ -173,7 +173,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -1168,7 +1168,7 @@ impl Module {
     /// Declarations no remaining call names leave the module (the validator
     /// refuses an external function nothing uses); the others keep their
     /// order, so `main` stays function 0.
-    fn drop_unused_functions(&mut self) {
+    pub(super) fn drop_unused_functions(&mut self) {
         let mut used: Vec<bool> = self.funcs.iter().map(|f| f.body).collect();
         for blk in &self.blocks {
             for &i in blk.phis.iter().chain(&blk.body) {
@@ -1401,6 +1401,55 @@ mod tests {
         let stores = stores(&m, b);
         assert_eq!(stores, [vec![x, four], vec![minus4, wide]]);
         m.write();
+    }
+
+    #[test]
+    fn resinfo_keeps_levels_when_a_driver_returns_clamped_dimensions() {
+        // Fold the actual instructions emitted for a synthetic GetDimensions
+        // result, including a driver returning nonzero sizes for mip 3 of 3.
+        for (kind, mip, shape, expected) in [
+            (2, Some(2), true, [8, 4, 0, 3]),
+            (2, Some(3), true, [0, 0, 0, 3]),
+            (2, Some(u32::MAX), false, [0, 0, 0, 3]),
+            (2, None, false, [8, 4, 1, 3]),
+            (1, None, true, [8, 1, 0, 3]),
+            (5, None, true, [8, 4, 6, 3]),
+            (6, None, true, [8, 4, 4, 3]),
+            (7, None, true, [8, 4, 2, 3]),
+            (3, None, true, [8, 4, 0, 1]),
+            (8, None, true, [8, 4, 2, 1]),
+        ] {
+            let Kit {
+                mut m, b, writes, ..
+            } = kit();
+            let dimensions = [8, 4, 2, 3].map(|v| m.i32(v));
+            let mip = mip.map(|v| m.i32(v));
+            let result = crate::emit::lower::resinfo_sizes(&mut m, b, kind, dimensions, mip, shape);
+            m.call(b, writes, result[..2].to_vec());
+            m.call(b, writes, result[2..].to_vec());
+            m.terminate(b, Term::Ret);
+            m.optimise(FOLD | DEAD);
+            let expected = expected.map(|v| m.i32(v));
+            assert_eq!(
+                stores(&m, b),
+                [expected[..2].to_vec(), expected[2..].to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn d16_resinfo_uses_two_registers_for_three_selected_sizes() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let components = [0x12345, 0xabcd, 0x10002].map(|v| m.i32(v));
+        let words = crate::emit::lower::packed_resinfo(&mut m, b, &components);
+        assert_eq!(words.len(), 2);
+        m.call(b, writes, words);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+        let expected = vec![m.i32(0xabcd2345), m.i32(2)];
+        assert_eq!(stores(&m, b), [expected]);
     }
 
     #[test]

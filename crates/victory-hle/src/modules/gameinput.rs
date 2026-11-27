@@ -1479,6 +1479,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            // The F1 settings menu takes the keyboard while it is shown.
+            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                return Vec::new();
+            }
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]

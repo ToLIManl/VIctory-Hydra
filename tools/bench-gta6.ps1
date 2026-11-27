@@ -170,11 +170,29 @@ $env:VICTORY_DYNAMIC_SLAB = "1"
 $env:VICTORY_ASYNC_RECYCLE = "1"
 $env:VICTORY_HEAP_ROUND = "32"
 $env:VICTORY_WINDOWS_BAR_MB = "0"
+$env:VICTORY_EARLY_DEPTH = "1"
+$env:VICTORY_WC_NO_BACK = "1"
+$env:VICTORY_WC_NO_BACK_MIN_KB = "1024"
+$env:VICTORY_SPANS_QUICK = "1"
+$env:VICTORY_ROOT_BIND_CACHE = "1"
+$env:VICTORY_WAVE_ZERO_MASK = "1"
+$env:VICTORY_RESINFO_MIP_BOUNDS = "1"
+$env:VICTORY_RESINFO_SHAPE = "1"
+$env:VICTORY_RESINFO_MSAA = "1"
+$env:VICTORY_RESINFO_D16 = "1"
+$env:VICTORY_COMPUTE_WINDOW_COHERENCE = "1"
+$env:VICTORY_WATER_LIGHT = "0"
+$env:VICTORY_LEAVE_OUT = "02384a60fda6f2d0,731a39171b568298"
+$env:VICTORY_SKIP_RT_TRACE = "1"
 
 $env:VICTORY_DSTORAGE_IO = "handles"
 $env:VICTORY_DSTORAGE_SORT = "1"
 $env:VICTORY_DSTORAGE_WORKERS = "3"
 $env:VICTORY_DSTORAGE_DECODE_WORKERS = "4"
+$env:VICTORY_DSTORAGE_CANCEL = "1"
+$env:VICTORY_DSTORAGE_ERROR_RECORD = "1"
+$env:VICTORY_DSTORAGE_PAGE_LIST = "1"
+$env:VICTORY_DSTORAGE_FILE_SOURCE = "1"
 $env:VICTORY_PIPELINE_LOWEST = "0"
 $env:VICTORY_PIPELINE_WORKERS = "3"
 
@@ -234,10 +252,13 @@ Write-Host "=== GTA 6 AUTO-BENCH [$Mode] tag=$Tag runner=$(Split-Path $runner -L
 Write-Host "Log: $logPath"
 
 Push-Location $LauncherDir
+$prevEap = $ErrorActionPreference
 try {
+    $ErrorActionPreference = "Continue"
     & $runner run $GameExe --console series-s --execute -- -skipToIIS *> $logPath
     $rc = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $prevEap
     Pop-Location
 }
 

@@ -165,6 +165,41 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .collect()
 }
 
+/// The synthetic loop stores the first result VGPR at the lane's index.
+#[test]
+fn resinfo_returns_packed_dimensions_and_zeros_missing_mips() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let enabled = |key| std::env::var_os(key).is_some_and(|v| v == "1");
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    let query = words.iter().position(|&w| w == 0xf09c_0f08).unwrap();
+    // image_get_resinfo with x and y enabled, the mip in v0 (the lane
+    // index), the result in v12, and the original per-lane descriptor.
+    words[query] = 0xf038_0308;
+    words[query + 1] = 0x8003_0c00;
+    let shader = build(&words, false);
+    let pixels = [[0.; 4]; 2];
+    let views = [
+        View::Texture(2, 1, &pixels),
+        View::Texture(1, 2, &pixels),
+        View::RawUav(32),
+    ];
+    for (device, sizes) in run(&shader, &views) {
+        let level_zero = if enabled("VICTORY_RESINFO_D16") { 0x0001_0002 } else { 2 };
+        assert_eq!(sizes[0], level_zero, "{device}");
+        if enabled("VICTORY_RESINFO_MIP_BOUNDS") {
+            assert!(sizes[1..].iter().all(|&word| word == 0), "{device}");
+        }
+    }
+    // Validate the two explicit multisample handle kinds without binding
+    // single-sample textures to a multisample shader.
+    if enabled("VICTORY_RESINFO_MSAA") {
+        for dim in [6, 7] {
+            words[query] = 0xf038_0300 | dim << 3;
+            build(&words, false);
+        }
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;

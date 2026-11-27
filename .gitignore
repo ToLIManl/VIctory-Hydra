@@ -16,6 +16,9 @@
 /HANDOFF.md
 /bench/
 /.swarm_work/
+/nvidia-sdk/
+/amd-sdk/
+/fidelityfx/
 
 # Screenshots / frame captures (never commit game screenshots; keep README banner)
 *.png

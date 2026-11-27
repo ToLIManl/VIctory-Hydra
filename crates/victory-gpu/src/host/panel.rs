@@ -59,7 +59,7 @@ fn asked() -> bool {
 }
 
 /// Whether it is shown now.
-fn shown() -> &'static AtomicBool {
+pub(super) fn shown() -> &'static AtomicBool {
     static SHOWN: OnceLock<AtomicBool> = OnceLock::new();
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
@@ -543,9 +543,14 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     // 1. Large coloured FPS header.
     let fps_str = format!("{:.0} FPS", s.fps.round());
     c.text(14, 12, 4, fps_color(s.fps), &fps_str);
-    // Subtle FPS decimal & ms badge on the right of the header.
-    let badge = format!("{:.1} FPS", s.fps);
-    c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
+    // Subtle FPS decimal or active Frame Generation rate badge on the right.
+    let fg_per = crate::streamline::shown_per_frame();
+    let (badge, badge_col) = if fg_per > 1 {
+        (format!("FG {fg_per}X {:.1}", s.fps * f64::from(fg_per)), GREEN)
+    } else {
+        (format!("{:.1} FPS", s.fps), MUTED)
+    };
+    c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, badge_col, &badge);
 
     // 2. Resolution | draws | GPU ms.
     let row2 = format!("{}X{} | {} DRAWS | GPU {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);

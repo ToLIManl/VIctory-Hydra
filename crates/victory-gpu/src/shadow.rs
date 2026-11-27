@@ -24,6 +24,65 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it.
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.push((at as u64, (at + len) as u64));
+}
+
+/// `[at, at + len)` (or the whole allocation at `at` when `len == 0`) was
+/// released or decommitted.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let at = at as u64;
+    let end = at.saturating_add(len as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&(from, to)| {
+        if len == 0 {
+            from != at
+        } else {
+            to <= at || from >= end
+        }
+    });
+}
+
+fn is_write_combined(start: u64, len: u64) -> bool {
+    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
+    all.iter()
+        .any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether shader writes into large card copies of write-combined title memory
+/// stay on the card without readback/merge (`VICTORY_WC_NO_BACK=1`; off by default).
+fn wc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+}
+
+/// Minimum copy size in bytes for [`wc_no_back`] (`VICTORY_WC_NO_BACK_MIN_KB`,
+/// default 1024 KiB so small readback buffers like exposure still come back).
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            * 1024
+    })
+}
+
+/// Bytes declared written by shaders in write-combined copies and left on the
+/// card ([`wc_no_back`]), since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -99,6 +158,8 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Whether this copy's title memory was asked for write-combined (0 unknown, 1 no, 2 yes).
+    wc: AtomicU8,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -3508,6 +3569,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            wc: AtomicU8::new(0),
             place: None,
         }
     }
@@ -3547,9 +3609,42 @@ impl Shadow {
             }
             return;
         }
+        // Write-combined title memory (`VICTORY_WC_NO_BACK=1`): CPU writes and
+        // GPU reads; shader writes to large card copies stay on the card
+        // instead of comparing, fetching and merging back to CPU every frame.
+        if self.card.is_some()
+            && wc_no_back()
+            && self.len >= wc_no_back_min()
+            && self.write_combined()
+        {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

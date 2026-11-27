@@ -180,6 +180,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read.
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     // The title may pass MEM_RESERVE_PLACEHOLDER directly, without the
     // console's PAGES_64K bits. Track the actual reservation made above so
     // arrange can give either form consecutive physical-page slices.

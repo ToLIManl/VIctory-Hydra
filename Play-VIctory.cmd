@@ -127,20 +127,62 @@ if not defined VICTORY_DYNAMIC_SLAB set "VICTORY_DYNAMIC_SLAB=1"
 if not defined VICTORY_ASYNC_RECYCLE set "VICTORY_ASYNC_RECYCLE=1"
 if not defined VICTORY_HEAP_ROUND set "VICTORY_HEAP_ROUND=32"
 if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=0"
+if not defined VICTORY_EARLY_DEPTH set "VICTORY_EARLY_DEPTH=1"
+if not defined VICTORY_WC_NO_BACK set "VICTORY_WC_NO_BACK=1"
+if not defined VICTORY_WC_NO_BACK_MIN_KB set "VICTORY_WC_NO_BACK_MIN_KB=1024"
+if not defined VICTORY_SPANS_QUICK set "VICTORY_SPANS_QUICK=1"
+if not defined VICTORY_ROOT_BIND_CACHE set "VICTORY_ROOT_BIND_CACHE=1"
+if not defined VICTORY_WAVE_ZERO_MASK set "VICTORY_WAVE_ZERO_MASK=1"
+if not defined VICTORY_RESINFO_MIP_BOUNDS set "VICTORY_RESINFO_MIP_BOUNDS=1"
+if not defined VICTORY_RESINFO_SHAPE set "VICTORY_RESINFO_SHAPE=1"
+if not defined VICTORY_RESINFO_MSAA set "VICTORY_RESINFO_MSAA=1"
+if not defined VICTORY_RESINFO_D16 set "VICTORY_RESINFO_D16=1"
+if not defined VICTORY_COMPUTE_WINDOW_COHERENCE set "VICTORY_COMPUTE_WINDOW_COHERENCE=1"
+if not defined VICTORY_WATER_LIGHT set "VICTORY_WATER_LIGHT=0"
+if not defined VICTORY_LEAVE_OUT set "VICTORY_LEAVE_OUT=02384a60fda6f2d0,731a39171b568298"
+if not defined VICTORY_SKIP_RT_TRACE set "VICTORY_SKIP_RT_TRACE=1"
 
 :: DirectStorage & Pipeline Compilation
 if not defined VICTORY_DSTORAGE_IO set "VICTORY_DSTORAGE_IO=handles"
 if not defined VICTORY_DSTORAGE_SORT set "VICTORY_DSTORAGE_SORT=1"
 if not defined VICTORY_DSTORAGE_WORKERS set "VICTORY_DSTORAGE_WORKERS=3"
 if not defined VICTORY_DSTORAGE_DECODE_WORKERS set "VICTORY_DSTORAGE_DECODE_WORKERS=4"
+if not defined VICTORY_DSTORAGE_CANCEL set "VICTORY_DSTORAGE_CANCEL=1"
+if not defined VICTORY_DSTORAGE_ERROR_RECORD set "VICTORY_DSTORAGE_ERROR_RECORD=1"
+if not defined VICTORY_DSTORAGE_PAGE_LIST set "VICTORY_DSTORAGE_PAGE_LIST=1"
+if not defined VICTORY_DSTORAGE_FILE_SOURCE set "VICTORY_DSTORAGE_FILE_SOURCE=1"
 if not defined VICTORY_PIPELINE_LOWEST set "VICTORY_PIPELINE_LOWEST=0"
 if not defined VICTORY_PIPELINE_WORKERS set "VICTORY_PIPELINE_WORKERS=3"
 
-:: Output & Pacing (performance-first default; override to 1920x1080 as desired)
+:: NVIDIA DLSS Super Resolution & AMD FSR 3 Frame Generation (auto-enabled when SDK DLLs are fetched)
+if not defined VICTORY_STREAMLINE_DIR (
+  if exist "%~dp0nvidia-sdk\Streamline\bin\x64\sl.interposer.dll" set "VICTORY_STREAMLINE_DIR=%~dp0nvidia-sdk\Streamline\bin\x64"
+)
+if defined VICTORY_STREAMLINE_DIR if exist "%VICTORY_STREAMLINE_DIR%\sl.interposer.dll" (
+  if not defined VICTORY_DLSS set "VICTORY_DLSS=1"
+  if not defined VICTORY_DLSS_MODE set "VICTORY_DLSS_MODE=quality"
+)
+if not defined VICTORY_FIDELITYFX_DIR (
+  if exist "%~dp0amd-sdk\FidelityFX\bin\amd_fidelityfx_framegeneration_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%~dp0amd-sdk\FidelityFX\bin"
+)
+if defined VICTORY_FIDELITYFX_DIR if exist "%VICTORY_FIDELITYFX_DIR%\amd_fidelityfx_framegeneration_dx12.dll" (
+  if not defined VICTORY_FSR_FRAMEGEN set "VICTORY_FSR_FRAMEGEN=1"
+  if not defined VICTORY_FRAMEGEN_X set "VICTORY_FRAMEGEN_X=2"
+  if not defined VICTORY_TEXTURE_ROOM_PERCENT set "VICTORY_TEXTURE_ROOM_PERCENT=80"
+)
+
+:: F1 Settings Menu & Top-Left FPS/FG Counter
+if not defined VICTORY_FPS_LINE set "VICTORY_FPS_LINE=1"
+if not defined VICTORY_MENU_PLAY set "VICTORY_MENU_PLAY=%~f0"
+if not defined VICTORY_MENU_FILE set "VICTORY_MENU_FILE=%~dp0victory-settings.txt"
+
+:: Output & Pacing (720p + DLSS Quality + FSR 3 FG 2x default; change live/restart via F1)
 if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1280x720"
-if not defined VICTORY_UPSCALER set "VICTORY_UPSCALER=6"
-if not defined VICTORY_RENDER_SCALE set "VICTORY_RENDER_SCALE=0.667"
-if not defined VICTORY_FRAME_INTERVAL_MS set "VICTORY_FRAME_INTERVAL_MS=16.667"
+if not defined VICTORY_DLSS if not defined VICTORY_FSR_FRAMEGEN (
+  if not defined VICTORY_UPSCALER set "VICTORY_UPSCALER=6"
+  if not defined VICTORY_RENDER_SCALE set "VICTORY_RENDER_SCALE=0.667"
+)
+if not defined VICTORY_FRAME_INTERVAL_MS set "VICTORY_FRAME_INTERVAL_MS=0"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console %VICTORY_CONSOLE% --execute %*

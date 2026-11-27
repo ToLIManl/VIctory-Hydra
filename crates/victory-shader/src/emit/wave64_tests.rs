@@ -1054,3 +1054,6 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+#[path = "paired_tests.rs"]
+mod paired;

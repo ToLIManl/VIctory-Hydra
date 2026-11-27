@@ -63,6 +63,14 @@ pub(crate) struct Heap {
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    /// Heap ranges whose `read_into` failed (e.g., momentarily unmapped during
+    /// a remap race after the write-watch reset cleared their dirty bits) so
+    /// they are retried on the next sync. Guarded by `has_unread` for zero
+    /// lock overhead on the common empty path.
+    #[cfg(windows)]
+    unread: std::sync::Mutex<std::collections::BTreeSet<(usize, usize)>>,
+    #[cfg(windows)]
+    has_unread: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -456,6 +464,15 @@ pub(crate) fn sync_heaps() {
                 }
             }
         }
+        // Retry any ranges whose `read_into` failed on an earlier sync (e.g.
+        // momentarily unmapped during a remap after write-watch reset cleared
+        // their dirty bits). Fast-path atomic avoids locking on the common empty case.
+        if heap.has_unread.swap(false, Relaxed) {
+            let mut unread = heap.unread.lock().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in std::mem::take(&mut *unread) {
+                parts.push((from, to, false));
+            }
+        }
         // The marks' runs are short: more of them a job.
         let pages_a_job = if port { pages_a_job.max(parts.len() / 48) } else { pages_a_job };
         // A few pages a thread at a time: read, compared with what was last
@@ -485,6 +502,7 @@ pub(crate) fn sync_heaps() {
                         if let Some(began) = checking {
                             crate::port_descriptors::CHECKED[4].fetch_add(since(began), Relaxed);
                         }
+                        out.unread.push((from, to));
                         continue;
                     }
                     // (A run of marked slots is no page; nor does it ask the guards.)
@@ -566,6 +584,7 @@ pub(crate) fn sync_heaps() {
         });
         phase.end();
         drop(copied);
+        let mut unread_next: Vec<(usize, usize)> = Vec::new();
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
             pages += part.pages;
@@ -578,9 +597,15 @@ pub(crate) fn sync_heaps() {
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
             make.append(&mut part.make);
+            unread_next.append(&mut part.unread);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
             }
+        }
+        if !unread_next.is_empty() {
+            let mut unread = heap.unread.lock().unwrap_or_else(|e| e.into_inner());
+            unread.extend(unread_next);
+            heap.has_unread.store(true, Relaxed);
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
@@ -627,6 +652,7 @@ struct SyncPart {
     nothing: u64,
     make: Vec<u32>,
     wait: Vec<u32>,
+    unread: Vec<(usize, usize)>,
     kinds: [u64; 5],
 }
 
@@ -1749,6 +1775,10 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        unread: Default::default(),
+        #[cfg(windows)]
+        has_unread: std::sync::atomic::AtomicBool::new(false),
     });
     // Renderer port #2: the title's own stores tell this heap's slots.
     #[cfg(windows)]

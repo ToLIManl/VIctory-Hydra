@@ -27,6 +27,9 @@ mod coalesce;
 mod epoch;
 #[cfg(windows)]
 pub mod external;
+/// True while the F1 settings menu is open so host keyboard input is kept from the title.
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -98,6 +101,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
@@ -137,6 +142,8 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
     Remapping, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading,

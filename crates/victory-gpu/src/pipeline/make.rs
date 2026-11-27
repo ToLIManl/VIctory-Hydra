@@ -87,7 +87,41 @@ fn bvh_only_trace(shaders: &[Arc<Shader>]) -> bool {
     })
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`). E.g. `02384a60fda6f2d0`
+/// (`CS_DefragHeap_ComputeRelocations`) and `731a39171b568298` (heat haze).
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
+/// Tiled water volume light (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`): 64-lane wave shaders that on 32-lane NVIDIA hosts
+/// produce dark blocks on open water and burn ~15-25 ms of GPU time/frame.
+/// Left out by default on 32-lane hosts; `VICTORY_WATER_LIGHT=1` re-enables them.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
