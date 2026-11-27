@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=flat-square" alt="License">
 </p>
 
+<p align="center">
+  <b>Language:</b> <b>English</b> · <a href="README.ru.md">Русский (README.ru.md)</a>
+</p>
+
 ---
 
 ## What is VIctory-Hydra?
@@ -23,6 +27,34 @@
 **VIctory-Hydra** is a community-driven "Frankenstein" unification branch built on top of `cool_fox` / `VIctory`. Instead of leaving breakthroughs scattered across a dozen incompatible forks, every major optimization and shader fix is cherry-picked, adapted cleanly, and **A/B benchmarked on real NVIDIA RTX & mid-range CPU hardware** — keeping what genuinely improves frame time, stability, or visual fidelity, and disabling or fixing what regresses.
 
 > **Legal & Asset Policy Notice:** This repository contains **zero** copyrighted game code, binaries, textures, shaders, audio, or screenshots. Every runtime file is supplied locally by the user from their own legal dump, enforced automatically by `cargo xtask policy` and `.githooks/pre-commit`. See [docs/asset-policy.md](docs/asset-policy.md).
+
+---
+
+## Current Progress, FPS & Test PC Specs
+
+### Reference Hardware (Primary Test Rig)
+| Component | Specification |
+| :--- | :--- |
+| **OS** | Windows 11 x64 (Build `22621`) |
+| **CPU** | AMD Ryzen 5 5600X (6 Cores / 12 Threads, Zen 3) |
+| **GPU** | NVIDIA GeForce RTX 3060 12 GB (`ID3D12Device13`, D3D12 Agility SDK `1.620.2`, ~11,345 MiB VRAM budget) |
+| **RAM** | 32 GB DDR4 |
+| **Storage** | HDD for game dump · SSD for `%LOCALAPPDATA%` shader & pipeline cache |
+
+### Current Performance & Status (`1280×720`, `render_scale = 0.667`, `--console series-s`, Release)
+- **Menus / Loading:** `60.0 FPS` (`16.7 ms/frame`).
+- **In-World Automated Benchmark (205 world frames / 20.0s, `avg_draws = 6,284`):**
+  - **Mean:** `11.24 FPS` (`89.0 ms/frame`) · **Median:** `11.71 FPS` (`85.4 ms/frame`) · `p90 = 104.5 ms`.
+- **In-World Live Gameplay:** **`13–14 FPS`** (`69.3–79.5 ms/frame` at `4,444–4,786 draws/frame`) with full character models, clothing, shadows, ambient reflections, and HUD rendered accurately.
+- **Bottleneck Breakdown:** The RTX 3060 finishes GPU passes in **`8.9–17.5 ms/frame`** on typical world scenes (`~34.9 ms` during streaming bursts). The primary bottleneck today is **CPU-side frame preparation & draw submission (`31–69 ms/frame`)** on 6 cores — **Stage 8** focuses specifically on cutting CPU frame-prep overhead to reach a playable **`30+ FPS`** baseline before scaling up resolution and quality.
+
+### Stage Roadmap
+| Stage | Focus | Status |
+| :--- | :--- | :--- |
+| **Stages 1–5** | Core `cool_fox` pareto residency, 256-shard guard locks, NaN scrub, eager decoration/face bakes, mesh launch setup | Done |
+| **Stages 6–6.1** | `MSInfo.PayloadSizeInBytes` fix (unlocking 1,762 mesh pipelines), removal of ~3,964 global UAV barriers/frame, card-window VRAM budgets, HDD elevator I/O sort | Done |
+| **Stages 7–7B** | Automated bench/A-B/replay harness, live A/B regression fixes (`VICTORY_UM_WATCH=0`, `constant:0.8`), Neptune `victory-shader` fixes (NVIDIA LDS atomics, CFG sections, `one_mode_per_register`, BVH trace limit) | Done (warming shaders & testing) |
+| **Stage 8** | Next CPU performance wave toward **30+ FPS**: `VICTORY_GPU_DETILE`, `VICTORY_SEGMENTS_ACROSS`, `VICTORY_SPREAD_LEAN`, `VICTORY_ASYNC_PRESENT`, `VICTORY_HEAP_WORKER` | Next |
 
 ---
 
