@@ -1287,8 +1287,12 @@ mod tests {
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
-        let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        let (all, usual, fast) = (
+            super::bitcode::opt::ALL,
+            super::bitcode::opt::DEFAULT,
+            super::bitcode::opt::FAST,
+        );
+        assert_eq!(usual, 63 | fast, "the passes before wide loads, plus safe fast-math");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);

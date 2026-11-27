@@ -1509,23 +1509,25 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
-        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let vs = compile(&dxc, dir.path(), VS, "vs_6_0");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_0");
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // depth comparison ALWAYS / no depth writes so only depth bounds gates
+        // the draw (`DepthEnable = true` also satisfies WARP, which skips depth
+        // bounds when `DepthEnable = false`).
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
-                ..Default::default()
+                ..g.depth1()
             },
         );
         // SAFETY: `sub` is a complete subobject 21.
