@@ -3420,6 +3420,23 @@ impl Deferred {
         }
     }
 
+    /// Cancels any active placed-copy forwards whose destination or source
+    /// overlaps `[addr, addr + len)` (e.g. a later shader write in this list).
+    fn invalidate_forward(&mut self, addr: usize, len: usize) {
+        if self.forward.is_empty() || len == 0 {
+            return;
+        }
+        let Some(end) = addr.checked_add(len) else {
+            self.forward.clear();
+            return;
+        };
+        let overlaps = |a: usize, a_end: usize, b: usize, b_end: usize| a < b_end && b < a_end;
+        self.forward.retain(|&(d, l, s)| {
+            let (d_end, s_end) = (d.saturating_add(l), s.saturating_add(l));
+            !overlaps(d, d_end, addr, end) && !overlaps(s, s_end, addr, end)
+        });
+    }
+
     /// If `[src, src + len)` lies entirely inside an active placed copy's
     /// destination in this list, returns the corresponding source address.
     fn resolve_fill_src(&self, src: usize, len: usize) -> Option<usize> {
@@ -5051,10 +5068,16 @@ mod late_tests {
         // Self-overlapping copy must NOT be recorded and invalidates overlaps.
         d.placed_written(0x7010, 0x40, 0x7000);
         assert_eq!(d.resolve_fill_src(0x7010, 0x40), None);
-        // Any general title write clears all forwards.
-        d.title_written();
+        // Later GPU shader write cancels forwards overlapping dst or src.
+        d.invalidate_forward(0x2010, 0x20);
         assert_eq!(d.resolve_fill_src(0x2020, 0x40), None);
+        assert_eq!(d.resolve_fill_src(0x3010, 0x20), Some(0x6030));
+        d.invalidate_forward(0x6020, 0x20);
         assert_eq!(d.resolve_fill_src(0x3010, 0x20), None);
+        // Any general title write clears all forwards.
+        d.placed_written(0x8000, 0x100, 0x9000);
+        d.title_written();
+        assert_eq!(d.resolve_fill_src(0x8000, 0x100), None);
     }
 }
 
@@ -8618,6 +8641,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        deferred.invalidate_forward(address, len);
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
