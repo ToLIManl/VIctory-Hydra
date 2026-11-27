@@ -660,7 +660,7 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -951,10 +951,10 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
+        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);

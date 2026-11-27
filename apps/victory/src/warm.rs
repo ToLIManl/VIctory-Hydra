@@ -92,7 +92,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             let refused = state.1;
                             let crashed = state.2;
                             let total = all.len();
-                            if count == total || count % 25 == 0 || state.3.elapsed() >= Duration::from_secs(2) {
+                            if count == total || count.is_multiple_of(25) || state.3.elapsed() >= Duration::from_secs(2) {
                                 state.3 = Instant::now();
                                 let elapsed = began.elapsed().as_secs_f64().max(0.001);
                                 let pct = count as f64 * 100.0 / total.max(1) as f64;

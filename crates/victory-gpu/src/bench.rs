@@ -64,6 +64,7 @@ fn config() -> Option<&'static Config> {
 /// Set once the first 3D world frame (`draws >= min_draws`) has been presented.
 static WORLD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 pub(crate) fn world_entered() -> bool {
     WORLD_ACTIVE.load(Relaxed)
 }

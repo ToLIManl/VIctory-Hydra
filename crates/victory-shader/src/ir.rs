@@ -793,6 +793,15 @@ pub(crate) fn whole_sections(p: &Program) -> Option<Program> {
     if fuse.is_empty() {
         return None;
     }
+    // Avoid chained fusion in a single pass: if both `(b1, join1)` and `(join1, join2)`
+    // are candidates, fusing them simultaneously copies pre-fusion `join1` into `b1`
+    // while clearing `join2` to `Exit::End` (truncating `b1`!). Skip pairs whose target
+    // is also a source; the outer `for _ in 0..4` loop in `emit/mod.rs` fuses chains safely.
+    let sources: HashSet<usize> = fuse.iter().map(|&(b, _)| b).collect();
+    fuse.retain(|&(_, join)| !sources.contains(&join));
+    if fuse.is_empty() {
+        return None;
+    }
     let mut blocks = p.blocks.clone();
     for block in &mut blocks {
         block.phis.clear();

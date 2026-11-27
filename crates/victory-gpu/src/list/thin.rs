@@ -756,7 +756,7 @@ fn is_state_op(op: u64) -> bool {
 }
 
 #[inline]
-fn slice_at<'a, T>(w: &'a [u64], from: usize, count: usize) -> &'a [T] {
+fn slice_at<T>(w: &[u64], from: usize, count: usize) -> &[T] {
     let ptr: *const T = at(w, from, count);
     if ptr.is_null() || count == 0 {
         &[]

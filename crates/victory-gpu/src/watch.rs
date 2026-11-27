@@ -1158,6 +1158,7 @@ fn alone(start: usize, end: usize, pages: usize, took: std::time::Duration) {
 
 /// Diagnostics, for the frame lines: [`ALONE`] per frame, the busiest.
 #[cfg(feature = "diagnostics")]
+#[allow(dead_code)]
 pub(crate) fn alone_line(frames: f64) {
     let all = ALONE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     if all.is_empty() {

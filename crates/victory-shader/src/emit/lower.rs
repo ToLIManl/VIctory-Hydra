@@ -195,7 +195,7 @@ fn ordered_section(p: &Program) -> HashSet<Site> {
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
-fn inline_f16(c: u8) -> u32 {
+pub(super) fn inline_f16(c: u8) -> u32 {
     [
         0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
     ][usize::from(c - 240)]
@@ -1516,7 +1516,7 @@ impl<'a> Lower<'a> {
                                 let slot = s.lds_dwords;
                                 s.lds_dwords += 2 * waves;
                                 // (one dword more is `halves`, below: the LDS ends at 8192 dwords at most)
-                                let slot2 = if group > 32 && s.lds_dwords + 2 * waves + 1 <= 8192 {
+                                let slot2 = if group > 32 && s.lds_dwords + 2 * waves < 8192 {
                                     let second = s.lds_dwords;
                                     s.lds_dwords += 2 * waves;
                                     Some(second)
@@ -2526,8 +2526,12 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
-                    // No wave overlaps this one (see `ordered_section`).
-                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // The ordered section's collision id (overlap bit 31 clear,
+                    // wave id 1 in bits 16..25, collision id 0 in bits 0..9)
+                    // so `wave_id + ~collision_id` is 0 rather than 0xffff_ffff
+                    // and inactive lanes exit POPS wait loops after one pass
+                    // (see `ordered_section`; adapted from VIctory 7ac1f54d83).
+                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(1 << 16)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -13826,7 +13830,7 @@ mod tests {
             for granules in 1..=63u32 {
                 let lds = granules * 128;
                 let dwords = wave64_crossing_lds(threads, granules);
-                let second = lds + 2 * waves + 2 * waves + 1 <= 8192;
+                let second = lds + 2 * waves + 2 * waves < 8192;
                 let want = lds + if second { 4 * waves } else { 2 * waves } + 1;
                 assert_eq!(dwords, want, "{threads} threads, {granules} granules");
                 assert!(dwords <= 8192, "{threads} threads, {granules} granules: {dwords} dwords");

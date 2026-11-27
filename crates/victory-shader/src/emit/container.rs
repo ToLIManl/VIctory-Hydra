@@ -516,10 +516,11 @@ mod tests {
             usage: 15,
             half: false,
         };
+        let element2 = element.clone();
         let psv = psv(&Psv {
             stage: 1,
             flag: false,
-            inputs: &[element.clone()],
+            inputs: std::slice::from_ref(&element2),
             outputs: &[element],
             prims: &[],
             mesh: None,

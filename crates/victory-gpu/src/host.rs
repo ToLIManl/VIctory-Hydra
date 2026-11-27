@@ -2086,6 +2086,7 @@ impl<T> ReadbackLease<'_, T> {
         self.buffer.as_ref().expect("a live readback has its buffer")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stats(&self) -> ReadbackStats {
         self.pool.0.lock().unwrap_or_else(|e| e.into_inner()).1
     }
@@ -2457,7 +2458,14 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With `VICTORY_PATCH_LEAN` (`crate::shadow::patch_lean_now`): buffers
+    /// of masked patch words whose submissions have run (buffer, mapping,
+    /// bytes), for the next patches; at most [`PATCH_POOL_MOST`].
+    patch_pool: Vec<(ID3D12Resource, usize, u64)>,
 }
+
+/// The most buffers of patch words [`CardWork::patch_pool`] keeps.
+const PATCH_POOL_MOST: usize = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3225,8 +3233,9 @@ struct CardPlan {
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     /// The masked patch's words ([`MASKED_PATCH`]), read by the plan's
-    /// list: alive until the submission has run.
-    _patch: Option<ID3D12Resource>,
+    /// list: alive until the submission has run (buffer, mapping, bytes;
+    /// lean, it goes back to [`CardWork::patch_pool`] then).
+    patch: Option<(ID3D12Resource, usize, u64)>,
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
@@ -3577,16 +3586,32 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
-    let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
+fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, bool)>) -> Vec<(usize, u32)> {
+    let mut pieces: Vec<_> = flags
+        .filter_map(|(copy, piece, wanted)| wanted.then_some((copy, piece)))
+        .collect();
     pieces.sort_unstable();
     pieces.dedup();
     pieces
 }
 
+/// Indices within one range, in the same order as scanning its pieces.
+fn flagged_in_range(
+    pieces: &[(usize, u32)],
+    copy: usize,
+    first: u32,
+    count: u32,
+) -> impl Iterator<Item = u32> + '_ {
+    let start = pieces.partition_point(|&key| key < (copy, first));
+    pieces[start..]
+        .iter()
+        .take_while(move |&&(owner, piece)| owner == copy && piece - first < count)
+        .map(move |&(_, piece)| piece - first)
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_in_range, flagged_pieces, landable};
 
     #[test]
     fn joined_readback_preserves_bytes_order_holes_and_distinct_resources() {
@@ -3644,12 +3669,45 @@ mod relay_tests {
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
         let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
+        let fetch = flagged_pieces(flags.into_iter());
         assert!(fetch.contains(&(a, 3)));
         assert!(!fetch.contains(&(a, 4)));
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    #[test]
+    fn visiting_flagged_pieces_matches_scanning_each_range() {
+        let flags = [
+            (2, 5, true),
+            (1, 34, true),
+            (1, 2, true),
+            (1, 7, false),
+            (1, 34, false),
+            (1, 8, true),
+            (1, 34, true),
+            (1, 6, true),
+            (2, u32::MAX, true),
+        ];
+        let fetch = flagged_pieces(flags.into_iter());
+        for (copy, first, count) in [
+            (0, 0, 40),
+            (1, 0, 40),
+            (1, 6, 29),
+            (1, 8, 26),
+            (1, 34, 0),
+            (1, 35, 2),
+            (2, 4, 3),
+            (2, u32::MAX - 1, 2),
+            (3, 0, 40),
+        ] {
+            let scanned: Vec<_> = (0..count)
+                .filter(|&p| fetch.binary_search(&(copy, first + p)).is_ok())
+                .collect();
+            let selected: Vec<_> = flagged_in_range(&fetch, copy, first, count).collect();
+            assert_eq!(selected, scanned);
+        }
     }
 }
 
@@ -3728,6 +3786,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3967,7 +4026,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -4597,7 +4656,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4736,6 +4795,17 @@ fn late_line(frames: f64) {
                 p[2] as f64 / frames,
                 p[3] as f64 / frames
             );
+            if crate::shadow::patch_lean_mode() != 0 {
+                let lean = [0, 1].map(|i| crate::shadow::PATCH_LEAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let made = [0, 1].map(|i| crate::shadow::PATCH_LEAN_BUFFERS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "the masked patch lean (VICTORY_PATCH_LEAN), per frame: {:.1} pages under the cap patched for their many runs ({:.0} runs that would have gone up one by one); buffers of words {:.1} made, {:.1} kept ones used again",
+                    lean[0],
+                    lean[1],
+                    made[0],
+                    made[1]
+                );
+            }
         }
     }
     if relay() {
@@ -5020,7 +5090,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -5051,8 +5121,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or nothing to do (in place).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -5392,6 +5462,7 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                patch_pool: Vec::new(),
             })
         }
     }
@@ -5524,12 +5595,29 @@ impl Host {
                 dirty.push((shadow.clone(), Vec::new()));
             }
         }
-        let mut patch_buffer: Option<ID3D12Resource> = None;
+        let mut patch_buffer: Option<(ID3D12Resource, usize, u64)> = None;
         let mut patch_at: Vec<(Arc<crate::shadow::Shadow>, u32, u32)> = Vec::new();
         if !patches.is_empty() {
             let words: usize = patches.iter().map(|(_, w, _)| w.len()).sum();
-            match (work.patch_pso.is_some(), self.shared_buffer((words * 12).max(16) as u64)) {
-                (true, Some((buffer, data))) => {
+            let bytes = (words * 12).max(16) as u64;
+            let lean = crate::shadow::patch_lean_now();
+            let kept = if lean { work.patch_pool.iter().position(|p| p.2 >= bytes) } else { None };
+            let buffer = match kept {
+                Some(at) => {
+                    crate::shadow::PATCH_LEAN_BUFFERS[1].fetch_add(1, Ordering::Relaxed);
+                    Some(work.patch_pool.swap_remove(at))
+                }
+                None => {
+                    let size = if lean { bytes.next_power_of_two().max(64 << 10) } else { bytes };
+                    if lean {
+                        crate::shadow::PATCH_LEAN_BUFFERS[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size))
+                }
+            };
+            match (work.patch_pso.is_some(), buffer) {
+                (true, Some((buffer, data, size))) => {
+                    let data = data as *mut u8;
                     name(&buffer, || "masked patch words".into());
                     let mut first = 0u32;
                     for (shadow, w, _) in &patches {
@@ -5541,7 +5629,7 @@ impl Host {
                         first += w.len() as u32;
                     }
                     crate::shadow::PATCHED[3].fetch_add(1, Ordering::Relaxed);
-                    patch_buffer = Some(buffer);
+                    patch_buffer = Some((buffer, data as usize, size));
                 }
                 _ => fail(format_args!(
                     "no memory or pipeline for the masked patch of host copies in the card's memory (VICTORY_MASKED_PATCH)"
@@ -5572,7 +5660,7 @@ impl Host {
                         looks = upcheck::record(self, list, &dirty);
                     }
                     // Masked patches run first while every patched copy buffer is still COMMON.
-                    if let (Some(words), Some(pso)) = (&patch_buffer, &work.patch_pso) {
+                    if let (Some((words, _, _)), Some(pso)) = (&patch_buffer, &work.patch_pso) {
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(pso);
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -5744,7 +5832,7 @@ impl Host {
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
-            _patch: patch_buffer,
+            patch: patch_buffer,
             lists: used,
             sent_as,
             looks,
@@ -5909,6 +5997,13 @@ impl Host {
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
+        // The patch's words are read: the buffer serves a later patch.
+        if crate::shadow::patch_lean_mode() != 0
+            && let Some(kept) = plan.patch
+            && work.patch_pool.len() < PATCH_POOL_MOST
+        {
+            work.patch_pool.push(kept);
+        }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.
@@ -5993,7 +6088,7 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags = plan
                     .ranges
                     .iter()
                     .filter(|r| !r.picked)
@@ -6003,18 +6098,14 @@ impl Host {
                             let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
                         })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                    });
+                let fetched = flagged_pieces(flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
-                    for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
-                            continue;
-                        }
+                    for p in flagged_in_range(&fetched, copy, r.span.first, r.span.pieces) {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
@@ -9409,6 +9500,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)]
     Title,
     Nothing,
     /// Another part of the submission begins.
