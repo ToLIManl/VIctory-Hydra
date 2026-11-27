@@ -13,9 +13,22 @@ if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
 )
 set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0victory.exe"
-if not exist "%runner%" set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
+if not exist "%runner%" set "runner=%~dp0victory-rtx-unified.exe"
 if not exist "%runner%" (
   echo Build the runtime first: cargo build --release --locked -p victory 1>&2
+  exit /b 2
+)
+
+for %%I in ("%runner%") do set "runner_dir=%%~dpI"
+if not exist "%runner_dir%D3D12\D3D12Core.dll" (
+  if exist "%~dp0D3D12\D3D12Core.dll" (
+    if not exist "%runner_dir%D3D12" mkdir "%runner_dir%D3D12" >nul 2>&1
+    copy /Y "%~dp0D3D12\D3D12Core.dll" "%runner_dir%D3D12\D3D12Core.dll" >nul
+  )
+)
+if not exist "%runner_dir%D3D12\D3D12Core.dll" (
+  echo ERROR: Missing DirectX 12 Agility SDK 1.620.2 ^(x64^): "%runner_dir%D3D12\D3D12Core.dll" 1>&2
+  echo Without it, D3D12 fails with 0x887E0003. See README.md ^(Requirements ^& Dependencies^). 1>&2
   exit /b 2
 )
 
@@ -45,7 +58,8 @@ set "VICTORY_LEVELS_ON_DEMAND=1"
 set "VICTORY_CARD_BUFFERS_MIN_KB=4096"
 set "VICTORY_CARD_BUFFERS_MB=256"
 set "VICTORY_D3D12_BACKGROUND=0"
+if not defined VICTORY_AUTO_A set "VICTORY_AUTO_A=90"
 if not defined VICTORY_LOG set "VICTORY_LOG=warn"
 
-"%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
+"%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute %*
 exit /b %errorlevel%

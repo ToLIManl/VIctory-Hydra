@@ -25,6 +25,19 @@ if not exist "%runner%" (
   exit /b 2
 )
 
+for %%I in ("%runner%") do set "runner_dir=%%~dpI"
+if not exist "%runner_dir%D3D12\D3D12Core.dll" (
+  if exist "%~dp0D3D12\D3D12Core.dll" (
+    if not exist "%runner_dir%D3D12" mkdir "%runner_dir%D3D12" >nul 2>&1
+    copy /Y "%~dp0D3D12\D3D12Core.dll" "%runner_dir%D3D12\D3D12Core.dll" >nul
+  )
+)
+if not exist "%runner_dir%D3D12\D3D12Core.dll" (
+  echo ERROR: Missing DirectX 12 Agility SDK 1.620.2 ^(x64^): "%runner_dir%D3D12\D3D12Core.dll" 1>&2
+  echo Without it, D3D12 fails with 0x887E0003. See README.md ^(Requirements ^& Dependencies^). 1>&2
+  exit /b 2
+)
+
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-s"
 
@@ -68,6 +81,8 @@ if not defined VICTORY_INDIRECT_BATCH set "VICTORY_INDIRECT_BATCH=2"
 if not defined VICTORY_CARD_AWAKE set "VICTORY_CARD_AWAKE=1"
 if not defined VICTORY_SHOW_AFTER set "VICTORY_SHOW_AFTER=1"
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
+if not defined VICTORY_THIN_THREADS set "VICTORY_THIN_THREADS=4"
+if not defined VICTORY_LAND_THREADS set "VICTORY_LAND_THREADS=4"
 if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
@@ -117,9 +132,9 @@ if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=0"
 if not defined VICTORY_DSTORAGE_IO set "VICTORY_DSTORAGE_IO=handles"
 if not defined VICTORY_DSTORAGE_SORT set "VICTORY_DSTORAGE_SORT=1"
 if not defined VICTORY_DSTORAGE_WORKERS set "VICTORY_DSTORAGE_WORKERS=3"
-if not defined VICTORY_DSTORAGE_DECODE_WORKERS set "VICTORY_DSTORAGE_DECODE_WORKERS=8"
+if not defined VICTORY_DSTORAGE_DECODE_WORKERS set "VICTORY_DSTORAGE_DECODE_WORKERS=4"
 if not defined VICTORY_PIPELINE_LOWEST set "VICTORY_PIPELINE_LOWEST=0"
-if not defined VICTORY_PIPELINE_WORKERS set "VICTORY_PIPELINE_WORKERS=6"
+if not defined VICTORY_PIPELINE_WORKERS set "VICTORY_PIPELINE_WORKERS=3"
 
 :: Output & Pacing (performance-first default; override to 1920x1080 as desired)
 if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1280x720"
