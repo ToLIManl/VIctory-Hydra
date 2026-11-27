@@ -55,12 +55,15 @@ if not defined VICTORY_TEXBACK_ASYNC set "VICTORY_TEXBACK_ASYNC=1"
 if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
 if not defined VICTORY_LIBRARY_SAVE_S set "VICTORY_LIBRARY_SAVE_S=120"
 
-:: Lighting, Reflection & Texture Stability
-if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=constant:0.8"
+:: Lighting, Reflection & Texture Stability (Directional SH GI + Specular Reflections + Crisp Textures)
+if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0.8"
+if not defined VICTORY_AMBIENT_SPECULAR set "VICTORY_AMBIENT_SPECULAR=1"
+if not defined VICTORY_AMBIENT_SPECULAR_ALPHA set "VICTORY_AMBIENT_SPECULAR_ALPHA=0"
+if not defined VICTORY_AMBIENT_ONCE set "VICTORY_AMBIENT_ONCE=0"
 if not defined VICTORY_AMBIENT_SHADE set "VICTORY_AMBIENT_SHADE=1.0,0.6"
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
-if not defined VICTORY_AMBIENT_REFLECT set "VICTORY_AMBIENT_REFLECT=0.5"
-if not defined VICTORY_KEEP_SHOWN set "VICTORY_KEEP_SHOWN=2"
+if not defined VICTORY_AMBIENT_REFLECT set "VICTORY_AMBIENT_REFLECT=0"
+if not defined VICTORY_KEEP_SHOWN set "VICTORY_KEEP_SHOWN=1"
 if not defined VICTORY_STALE_KEEP_MS set "VICTORY_STALE_KEEP_MS=10000"
 if not defined VICTORY_STALE_KEEP_MAX_MS set "VICTORY_STALE_KEEP_MAX_MS=120000"
 if not defined VICTORY_TEXTURE_BACK_MODES set "VICTORY_TEXTURE_BACK_MODES=0"
@@ -86,7 +89,7 @@ if not defined VICTORY_LAND_THREADS set "VICTORY_LAND_THREADS=4"
 if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
-if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
+if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=0"
 if not defined VICTORY_ASYNC_SUBMIT set "VICTORY_ASYNC_SUBMIT=1"
 if not defined VICTORY_SUBMIT_FRAMES set "VICTORY_SUBMIT_FRAMES=3"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=24"
@@ -152,7 +155,8 @@ if not defined VICTORY_DSTORAGE_ERROR_RECORD set "VICTORY_DSTORAGE_ERROR_RECORD=
 if not defined VICTORY_DSTORAGE_PAGE_LIST set "VICTORY_DSTORAGE_PAGE_LIST=1"
 if not defined VICTORY_DSTORAGE_FILE_SOURCE set "VICTORY_DSTORAGE_FILE_SOURCE=1"
 if not defined VICTORY_PIPELINE_LOWEST set "VICTORY_PIPELINE_LOWEST=0"
-if not defined VICTORY_PIPELINE_WORKERS set "VICTORY_PIPELINE_WORKERS=3"
+if not defined VICTORY_PIPELINE_WORKERS set "VICTORY_PIPELINE_WORKERS=6"
+if not defined VICTORY_LIBRARY_STATIC_SAMPLERS set "VICTORY_LIBRARY_STATIC_SAMPLERS=1"
 
 :: NVIDIA DLSS Super Resolution & AMD FSR 3 Frame Generation (auto-enabled when SDK DLLs are fetched)
 if not defined VICTORY_STREAMLINE_DIR (
@@ -161,6 +165,7 @@ if not defined VICTORY_STREAMLINE_DIR (
 if defined VICTORY_STREAMLINE_DIR if exist "%VICTORY_STREAMLINE_DIR%\sl.interposer.dll" (
   if not defined VICTORY_DLSS set "VICTORY_DLSS=1"
   if not defined VICTORY_DLSS_MODE set "VICTORY_DLSS_MODE=quality"
+  if not defined VICTORY_DLSS_PRESET set "VICTORY_DLSS_PRESET=k"
 )
 if not defined VICTORY_FIDELITYFX_DIR (
   if exist "%~dp0amd-sdk\FidelityFX\bin\amd_fidelityfx_framegeneration_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%~dp0amd-sdk\FidelityFX\bin"
@@ -176,8 +181,8 @@ if not defined VICTORY_FPS_LINE set "VICTORY_FPS_LINE=1"
 if not defined VICTORY_MENU_PLAY set "VICTORY_MENU_PLAY=%~f0"
 if not defined VICTORY_MENU_FILE set "VICTORY_MENU_FILE=%~dp0victory-settings.txt"
 
-:: Output & Pacing (720p + DLSS Quality + FSR 3 FG 2x default; change live/restart via F1)
-if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1280x720"
+:: Output & Pacing (1080p + DLSS 4 Preset K + FSR 3 FG 2x default; change live/restart via F1)
+if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1920x1080"
 if not defined VICTORY_DLSS if not defined VICTORY_FSR_FRAMEGEN (
   if not defined VICTORY_UPSCALER set "VICTORY_UPSCALER=6"
   if not defined VICTORY_RENDER_SCALE set "VICTORY_RENDER_SCALE=0.667"

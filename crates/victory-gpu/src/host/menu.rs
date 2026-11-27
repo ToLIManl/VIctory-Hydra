@@ -47,17 +47,66 @@ const OFF_ON: &[(&str, &str)] = &[("0", "OFF"), ("1", "ON")];
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
     Item {
-        var: "VICTORY_MENU_DLSS",
-        label: "DLSS SUPER RES",
+        var: "VICTORY_AMBIENT",
+        label: "AMBIENT LIGHT",
         values: &[
-            ("quality", "QUALITY (0.67)"),
-            ("balanced", "BALANCED (0.58)"),
-            ("performance", "PERFORMANCE (0.50)"),
-            ("ultraperformance", "ULTRA PERF (0.33)"),
-            ("dlaa", "DLAA (NATIVE)"),
+            ("0.8", "ESTIMATE 0.8 (GI)"),
+            ("1.0", "ESTIMATE 1.0 (GI)"),
+            ("0.5", "ESTIMATE 0.5 (GI)"),
+            ("constant:0.8", "CONSTANT 0.8"),
             ("off", "OFF"),
         ],
-        live: false,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_AMBIENT_SPECULAR",
+        label: "SPECULAR REFLECTIONS",
+        values: &[
+            ("1", "ON (1.0)"),
+            ("0.6", "ON (0.6)"),
+            ("1,0.2", "ON (1.0 / 0.2 SKY)"),
+            ("0", "OFF"),
+        ],
+        live: true,
+    },
+    Item {
+        var: "VICTORY_AMBIENT_SPECULAR_ALPHA",
+        label: "SPECULAR ALPHA LAYER",
+        values: &[
+            ("0", "OPAQUE ONLY"),
+            ("1", "OPAQUE AND ALPHA"),
+        ],
+        live: true,
+    },
+    Item {
+        var: "VICTORY_AMBIENT_ONCE",
+        label: "AMBIENT 1-BOUNCE",
+        values: &[
+            ("0", "OFF (MULTI-BOUNCE)"),
+            ("1", "ON (1 BOUNCE)"),
+        ],
+        live: true,
+    },
+    Item {
+        var: "VICTORY_AMBIENT_AIR",
+        label: "AMBIENT FOG CAP",
+        values: &[
+            ("0", "OFF"),
+            ("1.5", "1.5X"),
+            ("1.0", "1.0X"),
+            ("2.0", "2.0X"),
+        ],
+        live: true,
+    },
+    Item {
+        var: "VICTORY_AMBIENT_REFLECT",
+        label: "GLOSSY REFLECT CAP",
+        values: &[
+            ("0", "OFF (WITH SPECULAR)"),
+            ("0.5", "0.5 CAP"),
+            ("1.0", "1.0 CAP"),
+        ],
+        live: true,
     },
     Item {
         var: "VICTORY_MENU_FRAMEGEN",
@@ -67,16 +116,6 @@ const ITEMS: &[Item] = &[
             ("2", "2X"),
             ("3", "3X (RTX 40+)"),
             ("4", "4X (RTX 40+)"),
-        ],
-        live: false,
-    },
-    Item {
-        var: "VICTORY_MENU_FG_TYPE",
-        label: "FRAME GEN ENGINE",
-        values: &[
-            ("auto", "AUTO"),
-            ("fsr", "AMD FSR 3 (RTX 20/30)"),
-            ("dlss", "NVIDIA DLSS (RTX 40+)"),
         ],
         live: false,
     },
@@ -93,17 +132,6 @@ const ITEMS: &[Item] = &[
         live: false,
     },
     Item {
-        var: "VICTORY_MENU_OUTPUT",
-        label: "OUTPUT RESOLUTION",
-        values: &[
-            ("1280x720", "1280X720 (FAST)"),
-            ("1600x900", "1600X900"),
-            ("1920x1080", "1920X1080 (FHD)"),
-            ("2560x1440", "2560X1440 (QHD)"),
-        ],
-        live: false,
-    },
-    Item {
         var: "VICTORY_MENU_FPS",
         label: "FRAME RATE CAP",
         values: &[
@@ -112,7 +140,7 @@ const ITEMS: &[Item] = &[
             ("120", "120 FPS"),
             ("30", "30 FPS"),
         ],
-        live: false,
+        live: true,
     },
     Item {
         var: "VICTORY_FPS_LINE",
@@ -125,6 +153,58 @@ const ITEMS: &[Item] = &[
         label: "STATS PANEL (F3)",
         values: OFF_ON,
         live: true,
+    },
+    Item {
+        var: "VICTORY_WC_NO_BACK",
+        label: "SKIP WC COPY-BACKS",
+        values: ON_OFF,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_ROOT_BIND_CACHE",
+        label: "ROOT BIND CACHE",
+        values: ON_OFF,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_TEXTURE_NO_WAIT",
+        label: "TEXTURE NO WAIT",
+        values: ON_OFF,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_MENU_DLSS",
+        label: "DLSS SUPER RES",
+        values: &[
+            ("quality", "QUALITY (0.67)"),
+            ("balanced", "BALANCED (0.58)"),
+            ("performance", "PERFORMANCE (0.50)"),
+            ("ultraperformance", "ULTRA PERF (0.33)"),
+            ("dlaa", "DLAA (NATIVE)"),
+            ("off", "OFF"),
+        ],
+        live: false,
+    },
+    Item {
+        var: "VICTORY_MENU_FG_TYPE",
+        label: "FRAME GEN ENGINE",
+        values: &[
+            ("auto", "AUTO"),
+            ("fsr", "AMD FSR 3 (RTX 20/30)"),
+            ("dlss", "NVIDIA DLSS (RTX 40+)"),
+        ],
+        live: false,
+    },
+    Item {
+        var: "VICTORY_MENU_OUTPUT",
+        label: "OUTPUT RESOLUTION",
+        values: &[
+            ("1280x720", "1280X720 (FAST)"),
+            ("1600x900", "1600X900"),
+            ("1920x1080", "1920X1080 (FHD)"),
+            ("2560x1440", "2560X1440 (QHD)"),
+        ],
+        live: false,
     },
     Item {
         var: "VICTORY_WATER_LIGHT",
@@ -154,35 +234,6 @@ const ITEMS: &[Item] = &[
         var: "VICTORY_EARLY_DEPTH",
         label: "EARLY DEPTH TEST",
         values: ON_OFF,
-        live: false,
-    },
-    Item {
-        var: "VICTORY_WC_NO_BACK",
-        label: "SKIP WC COPY-BACKS",
-        values: ON_OFF,
-        live: false,
-    },
-    Item {
-        var: "VICTORY_ROOT_BIND_CACHE",
-        label: "ROOT BIND CACHE",
-        values: ON_OFF,
-        live: false,
-    },
-    Item {
-        var: "VICTORY_TEXTURE_NO_WAIT",
-        label: "TEXTURE NO WAIT",
-        values: ON_OFF,
-        live: false,
-    },
-    Item {
-        var: "VICTORY_AMBIENT",
-        label: "AMBIENT LIGHT",
-        values: &[
-            ("constant:0.8", "CONSTANT 0.8"),
-            ("constant:1.0", "CONSTANT 1.0"),
-            ("constant:0.5", "CONSTANT 0.5"),
-            ("", "OFF"),
-        ],
         live: false,
     },
 ];
@@ -235,7 +286,9 @@ fn new_console(command_line: &str) -> std::io::Result<()> {
 }
 
 fn live(item: &Item) -> bool {
-    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+    item.live
+        || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+        || (item.var == "VICTORY_DLSS_PRESET" && crate::streamline::dlss_live())
 }
 
 fn fps_line_on() -> &'static AtomicBool {
@@ -576,8 +629,10 @@ impl Menu {
         self.values[i] = item.values[next as usize].0.to_owned();
         if live(item) {
             self.apply_live(i);
+            self.note = "APPLIED LIVE (SAVE FOR NEXT START TO KEEP)".to_owned();
+        } else {
+            self.note.clear();
         }
-        self.note.clear();
     }
 
     fn apply_live(&self, i: usize) {
@@ -591,14 +646,39 @@ impl Menu {
             }
         }
         match var {
+            "VICTORY_AMBIENT" => crate::ambient::set_live(value),
+            "VICTORY_AMBIENT_SPECULAR" => crate::ambient::set_specular_live(value),
+            "VICTORY_AMBIENT_SPECULAR_ALPHA" => crate::ambient::set_specular_alpha_live(value == "1"),
+            "VICTORY_AMBIENT_ONCE" => crate::ambient::set_once_live(value == "1"),
+            "VICTORY_AMBIENT_AIR" => crate::ambient::set_air_live(value),
+            "VICTORY_AMBIENT_REFLECT" => crate::ambient::set_reflect_live(value),
+            "VICTORY_DLSS_PRESET" => crate::streamline::set_dlss_preset_live(value),
             "VICTORY_MENU_FRAMEGEN" => {
                 crate::streamline::set_framegen(value.parse().unwrap_or(0));
+            }
+            "VICTORY_MENU_FPS" => {
+                let ms = match value.as_str() {
+                    "30" => 33.333,
+                    "60" => 16.667,
+                    "120" => 8.333,
+                    _ => 0.0,
+                };
+                crate::frame::set_interval_live(ms);
             }
             "VICTORY_FPS_LINE" => {
                 fps_line_on().store(value != "0", Ordering::Relaxed);
             }
             "VICTORY_PANEL" => {
                 super::panel::shown().store(value == "1", Ordering::Relaxed);
+            }
+            "VICTORY_ROOT_BIND_CACHE" => {
+                crate::draw::set_root_bind_cache_live(value == "1");
+            }
+            "VICTORY_WC_NO_BACK" => {
+                crate::shadow::set_wc_no_back_live(value == "1");
+            }
+            "VICTORY_TEXTURE_NO_WAIT" => {
+                crate::texture::set_no_wait_live(value == "1");
             }
             _ => {}
         }

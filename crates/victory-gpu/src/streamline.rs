@@ -251,6 +251,31 @@ struct Functions {
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static DLSS_READY: AtomicBool = AtomicBool::new(false);
 static FG_READY: AtomicBool = AtomicBool::new(false);
+/// Live-updatable DLSS model preset (`u32::MAX` = use `plan.asked.preset`).
+static LIVE_PRESET: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Whether DLSS Super Resolution is currently running and can change preset live.
+pub fn dlss_live() -> bool {
+    DLSS_READY.load(Acquire)
+}
+
+/// Updates the DLSS model preset live from the F1 menu on the next upscale.
+pub(crate) fn set_dlss_preset_live(name: &str) {
+    let preset = if name.trim().is_empty() {
+        0
+    } else {
+        plan::preset(name).unwrap_or(0)
+    };
+    LIVE_PRESET.store(preset, Relaxed);
+    tracing::info!(preset, name, "DLSS preset: updated live from F1 menu");
+}
+
+fn active_preset(fallback: u32) -> u32 {
+    match LIVE_PRESET.load(Relaxed) {
+        u32::MAX => fallback,
+        p => p,
+    }
+}
 
 /// Streamline's proxies kept for frame generation: the device that made the
 /// direct queue and the queue the swap chain is made on.
@@ -277,7 +302,7 @@ struct Calls {
     /// Optimal render sizes by output size and mode.
     optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
     /// The mode, sizes and preset the last options named.
-    last: Option<(u32, [u32; 2], [u32; 2])>,
+    last: Option<(u32, [u32; 2], [u32; 2], u32)>,
     /// Frame generation: on, the frames for each rendered one last asked of it (0 off), and
     /// the frame whose simulation began.
     framegen_on: bool,
@@ -1151,7 +1176,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
             output = ?camera.output,
             mode = plan::sl_mode_name(recorded.mode),
             asked = plan.asked.mode.name(),
-            preset = plan.asked.preset,
+            preset = active_preset(plan.asked.preset),
             optimal = ?recorded.optimal,
             hdr = camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0,
             depth_inverted = camera.depth_inverted(),
@@ -1215,11 +1240,12 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         spent(T_UPSCALE_LOCK, began);
     }
     let output = camera.output;
+    let preset = active_preset(plan.asked.preset);
     let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
         if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
             return size;
         }
-        let options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+        let options = abi::DlssOptions::new(mode, output, preset);
         let mut settings = abi::DlssOptimalSettings::default();
         // SAFETY: filled options and a structure to fill.
         let code = unsafe { optimal_of(&options, &mut settings) };
@@ -1232,7 +1258,7 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
     let mode = plan::pick_mode(camera.render, output, optimal_of_mode)
         .ok_or_else(|| format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render))?;
-    let mut options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+    let mut options = abi::DlssOptions::new(mode, output, preset);
     options.pre_exposure = if pre_exposure > 0.0 { pre_exposure } else { 1.0 };
     options.color_buffers_hdr = abi::boolean(camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0);
     options.use_auto_exposure = abi::boolean(textures[EXPOSURE].is_none());
@@ -1242,8 +1268,8 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     if code != 0 {
         return Err(format!("slDLSSSetOptions: {} ({code})", abi::result_name(code)));
     }
-    let changed = calls.last != Some((mode, camera.render, output));
-    calls.last = Some((mode, camera.render, output));
+    let changed = calls.last != Some((mode, camera.render, output, preset));
+    calls.last = Some((mode, camera.render, output, preset));
     let token = frame_token(sl, id as u32).ok_or("no frame token")?;
     let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
     // SAFETY: constants for this frame and viewport.
@@ -1307,10 +1333,11 @@ pub fn upscaler_destroyed(context: usize) {
 const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
 
 /// Whether draws are looked at for the colour without the interface: frame
-/// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
+/// generation is currently wanted (`framegen_wanted() != 0`) on our swap chain
+/// and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
 #[inline]
 pub(crate) fn hudless_wanted() -> bool {
-    HUDLESS_WANTED.load(Relaxed)
+    HUDLESS_WANTED.load(Relaxed) && framegen_wanted() != 0
 }
 
 static HUDLESS_WANTED: AtomicBool = AtomicBool::new(false);

@@ -528,8 +528,17 @@ pub(crate) fn before_present(
         return;
     }
     let Some(ffx) = FFX.get() else { return };
-    // (Taken at every present: the copies of a texture not presented go.)
-    let hudless: Option<(ID3D12Resource, u32)> = if two_planes {
+    // The textures' states are those the submissions before this present
+    // left: only the line of submissions orders the two.
+    let line = crate::queue::line_on();
+    if !line {
+        once!(warn, "FSR 3 frame generation: the line of submissions did not start; frame generation stays off");
+    }
+    let wanted = super::framegen_wanted() != 0 && line;
+    // Skip HUD-less lookup & GetDesc completely when frame generation is off (1X).
+    let hudless: Option<(ID3D12Resource, u32)> = if !wanted {
+        None
+    } else if two_planes {
         Some((base.0.clone(), base.1))
     } else if super::hudless_wanted() {
         super::hudless_for(base.0).map(|copy| (copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32))
@@ -552,13 +561,6 @@ pub(crate) fn before_present(
     });
     let mut guard = live();
     let Some(live) = guard.as_mut() else { return };
-    // The textures' states are those the submissions before this present
-    // left: only the line of submissions orders the two.
-    let line = crate::queue::line_on();
-    if !line {
-        once!(warn, "FSR 3 frame generation: the line of submissions did not start; frame generation stays off");
-    }
-    let wanted = super::framegen_wanted() != 0 && line;
     let fresh = if wanted { super::fresh_inputs() } else { None };
     // The context, made at the first upscaling (its sizes are the title's)
     // and again when they change.
@@ -655,6 +657,12 @@ pub(crate) fn before_present(
         }
     }
     let on = prepared && wanted;
+    // When FG is already off (1X), avoid redundant ffxConfigure(enabled=false)
+    // calls on every present; only invoke it while active or on an on -> off edge.
+    if !on && !ON.load(Relaxed) {
+        PRESENTS_OFF.fetch_add(1, Relaxed);
+        return;
+    }
     let mut configure = ConfigureFrameGeneration {
         header: Header::new(CONFIGURE_FRAMEGENERATION),
         swap_chain: swap_chain.as_raw(),

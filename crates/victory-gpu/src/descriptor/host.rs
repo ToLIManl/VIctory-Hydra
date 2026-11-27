@@ -930,6 +930,7 @@ fn stale_rule() -> Rule {
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::epoch::bump(at, len);
+    super::note_remap();
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);

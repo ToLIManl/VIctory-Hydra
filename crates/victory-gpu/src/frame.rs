@@ -97,6 +97,26 @@ pub(crate) extern "system" fn set_interval(
     S_OK
 }
 
+/// Updates the host frame-pacing interval live from the F1 menu (`0.0` = unlimited).
+pub(crate) fn set_interval_live(ms: f64) {
+    let interval = if ms.is_finite() && ms > 0.0 {
+        Duration::from_nanos((ms.clamp(0.0, 1000.0) * 1e6).round() as u64)
+    } else {
+        Duration::ZERO
+    };
+    let first = LAST
+        .iter()
+        .map(|t| t.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    *clock() = Some(Clock {
+        start: Instant::now(),
+        interval,
+        first,
+    });
+    tracing::info!(?interval, "frame interval: updated live from F1 menu");
+}
+
 /// Device method: events are scheduled at every tick.
 pub(crate) extern "system" fn schedule(
     _: This,

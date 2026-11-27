@@ -554,7 +554,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    let sampler_order = super::samplers::order();
+    for part in [kind.as_bytes(), sampler_order.as_slice(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+        .chain([state.as_bytes()])
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }

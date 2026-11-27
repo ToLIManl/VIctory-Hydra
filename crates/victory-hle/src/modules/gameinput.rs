@@ -1526,6 +1526,12 @@ mod host {
         }
 
         fn mouse_pad(&mut self, active: bool) -> PadState {
+            // Suppress mouse camera/buttons while the F1 settings menu is open
+            // (port of VIctory-NVIDIA 86a3976, GPL-3.0-or-later).
+            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                self.disarm_mouse(foreground_window(), "settings menu open");
+                return PadState::default();
+            }
             if !gta_kbm() || !active {
                 self.disarm_mouse(foreground_window(), "stand-in inactive");
                 return PadState::default();

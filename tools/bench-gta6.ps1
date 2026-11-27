@@ -7,10 +7,10 @@ param(
     [int]$WarmupS = 6,
     [int]$PhaseS = 10,
     [string]$AbSwitches = "",
-    [string]$Output = "1280x720",
+    [string]$Output = "1920x1080",
     [string]$RenderScale = "0.667",
-    [string]$Ambient = "constant:0.8",
-    [string]$AmbientReflect = "0.5",
+    [string]$Ambient = "0.8",
+    [string]$AmbientReflect = "0",
     [string]$ExtraEnv = "",
     [string]$Tag = "run",
     [string]$LauncherDir = "",
@@ -85,6 +85,8 @@ if ([string]::IsNullOrWhiteSpace($GameExe) -or -not (Test-Path $GameExe)) {
 
 # Clean leftover VICTORY_* env vars in this process
 Get-ChildItem Env:VICTORY_* | Remove-Item -ErrorAction SilentlyContinue
+# Isolate benchmarks from the user's saved F1 victory-settings.txt
+$env:VICTORY_MENU_FILE = Join-Path $BenchDir "bench-no-settings.txt"
 
 # Baseline Stage 6.1 + Stage 7 runtime configuration (matches Play-GTA6-RTX.cmd)
 $env:VICTORY_GAME_DIR = Split-Path $GameExe -Parent
@@ -102,10 +104,13 @@ $env:VICTORY_LIBRARY_STORE_LATER = "1"
 $env:VICTORY_LIBRARY_SAVE_S = "120"
 
 $env:VICTORY_AMBIENT = $Ambient
+$env:VICTORY_AMBIENT_SPECULAR = "1"
+$env:VICTORY_AMBIENT_SPECULAR_ALPHA = "0"
+$env:VICTORY_AMBIENT_ONCE = "0"
 $env:VICTORY_AMBIENT_SHADE = "1.0,0.6"
 $env:VICTORY_AMBIENT_AIR = "1.5"
 $env:VICTORY_AMBIENT_REFLECT = $AmbientReflect
-$env:VICTORY_KEEP_SHOWN = "2"
+$env:VICTORY_KEEP_SHOWN = "1"
 $env:VICTORY_STALE_KEEP_MS = "10000"
 $env:VICTORY_STALE_KEEP_MAX_MS = "120000"
 $env:VICTORY_TEXTURE_BACK_MODES = "0"
@@ -131,7 +136,7 @@ $env:VICTORY_UNDER_THREADS = "3"
 $env:VICTORY_MAP_THREADS = "1"
 $env:VICTORY_WIDE_MERGE = "1"
 $env:VICTORY_UPLOAD_AHEAD = "1"
-$env:VICTORY_LEVELS_ON_DEMAND = "1"
+$env:VICTORY_LEVELS_ON_DEMAND = "0"
 $env:VICTORY_ASYNC_SUBMIT = "1"
 $env:VICTORY_SUBMIT_FRAMES = "3"
 $env:VICTORY_JOIN_PARTS = "24"
@@ -194,7 +199,8 @@ $env:VICTORY_DSTORAGE_ERROR_RECORD = "1"
 $env:VICTORY_DSTORAGE_PAGE_LIST = "1"
 $env:VICTORY_DSTORAGE_FILE_SOURCE = "1"
 $env:VICTORY_PIPELINE_LOWEST = "0"
-$env:VICTORY_PIPELINE_WORKERS = "3"
+$env:VICTORY_PIPELINE_WORKERS = "6"
+$env:VICTORY_LIBRARY_STATIC_SAMPLERS = "1"
 
 $env:VICTORY_OUTPUT = $Output
 $env:VICTORY_UPSCALER = "6"

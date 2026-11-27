@@ -61,9 +61,23 @@ fn is_write_combined(start: u64, len: u64) -> bool {
 
 /// Whether shader writes into large card copies of write-combined title memory
 /// stay on the card without readback/merge (`VICTORY_WC_NO_BACK=1`; off by default).
+/// Live-updatable from the F1 menu.
+fn wc_no_back_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"),
+        )
+    })
+}
+
 fn wc_no_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+    wc_no_back_cell().load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_wc_no_back_live(on: bool) {
+    wc_no_back_cell().store(on, Ordering::Relaxed);
+    tracing::info!(on, "wc_no_back: updated live from F1 menu");
 }
 
 /// Minimum copy size in bytes for [`wc_no_back`] (`VICTORY_WC_NO_BACK_MIN_KB`,

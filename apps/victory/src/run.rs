@@ -137,18 +137,27 @@ fn apply_menu_settings() {
             let n: u32 = fg.parse().unwrap_or(0);
             std::env::set_var("VICTORY_FRAMEGEN_X", n.to_string());
             if n == 0 {
-                // Keep FSR3 / DLSS FG ready so the F1 menu can switch it back on LIVE.
+                // Keep FSR3 / DLSS FG ready so the F1 menu can switch it back on LIVE,
+                // and reclaim VRAM headroom for textures while FG is off (Opus B9: 88%).
                 if std::env::var_os("VICTORY_FSR_FRAMEGEN").is_none()
                     && std::env::var_os("VICTORY_FIDELITYFX_DIR").is_some()
                 {
                     std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
                 }
-            } else if fg_type.is_none() {
-                if std::env::var_os("VICTORY_FIDELITYFX_DIR").is_some() {
-                    std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                if find_saved("VICTORY_TEXTURE_ROOM_PERCENT").is_none() {
+                    std::env::set_var("VICTORY_TEXTURE_ROOM_PERCENT", "88");
                 }
-                if std::env::var_os("VICTORY_STREAMLINE_DIR").is_some() {
-                    std::env::set_var("VICTORY_FRAMEGEN", "1");
+            } else {
+                if fg_type.is_none() {
+                    if std::env::var_os("VICTORY_FIDELITYFX_DIR").is_some() {
+                        std::env::set_var("VICTORY_FSR_FRAMEGEN", "1");
+                    }
+                    if std::env::var_os("VICTORY_STREAMLINE_DIR").is_some() {
+                        std::env::set_var("VICTORY_FRAMEGEN", "1");
+                    }
+                }
+                if find_saved("VICTORY_TEXTURE_ROOM_PERCENT").is_none() {
+                    std::env::set_var("VICTORY_TEXTURE_ROOM_PERCENT", "80");
                 }
             }
         }
@@ -213,6 +222,25 @@ fn apply_menu_settings() {
         }
         if std::env::var_os("VICTORY_WATER_LIGHT").is_none() {
             std::env::set_var("VICTORY_WATER_LIGHT", "0");
+        }
+        if std::env::var_os("VICTORY_AMBIENT_SPECULAR").is_none() {
+            std::env::set_var("VICTORY_AMBIENT_SPECULAR", "0");
+        }
+        if std::env::var_os("VICTORY_AMBIENT_SPECULAR_ALPHA").is_none() {
+            std::env::set_var("VICTORY_AMBIENT_SPECULAR_ALPHA", "0");
+        }
+        if std::env::var_os("VICTORY_AMBIENT_ONCE").is_none() {
+            std::env::set_var("VICTORY_AMBIENT_ONCE", "0");
+        }
+        if std::env::var_os("VICTORY_AMBIENT_AIR").is_none() {
+            std::env::set_var("VICTORY_AMBIENT_AIR", "0");
+        }
+        if std::env::var_os("VICTORY_AMBIENT_REFLECT").is_none() {
+            let spec_on = std::env::var("VICTORY_AMBIENT_SPECULAR")
+                .ok()
+                .and_then(|v| v.split(',').next().and_then(|s| s.trim().parse::<f32>().ok()))
+                .is_some_and(|v| v > 0.0);
+            std::env::set_var("VICTORY_AMBIENT_REFLECT", if spec_on { "0" } else { "0.5" });
         }
     }
 }

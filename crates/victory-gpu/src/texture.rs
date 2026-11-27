@@ -373,9 +373,22 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. A staging buffer that holds nothing
 /// yet is filled with what is there all the same ([`fill_unlocked`]): a list
 /// has recorded the upload from it by then.
+fn no_wait_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"),
+        )
+    })
+}
+
 fn no_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    no_wait_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_no_wait_live(on: bool) {
+    no_wait_cell().store(on, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(on, "texture no_wait: updated live from F1 menu");
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page

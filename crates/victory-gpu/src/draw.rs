@@ -572,8 +572,35 @@ pub(crate) struct State {
 
 #[derive(Default)]
 struct RootBindings {
-    constants: Vec<Option<Vec<u32>>>,
+    constants: Vec<Option<RootConstants>>,
     resources: Vec<Option<RootResource>>,
+}
+
+/// Inline root-constant cache entry (D3D12 root signatures allow at most 64 DWORDs),
+/// avoiding per-draw heap allocations when `VICTORY_ROOT_BIND_CACHE=1`.
+#[derive(Clone, Copy)]
+struct RootConstants {
+    len: u8,
+    vals: [u32; 64],
+}
+
+impl RootConstants {
+    fn from_slice(values: &[u32]) -> Option<Self> {
+        if values.len() > 64 {
+            return None;
+        }
+        let mut vals = [0u32; 64];
+        vals[..values.len()].copy_from_slice(values);
+        Some(Self {
+            len: values.len() as u8,
+            vals,
+        })
+    }
+
+    #[inline]
+    fn matches(&self, values: &[u32]) -> bool {
+        usize::from(self.len) == values.len() && &self.vals[..usize::from(self.len)] == values
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -589,14 +616,54 @@ impl RootBindings {
         self.constants.clear();
         self.resources.clear();
     }
+
+    #[inline]
+    fn bind_constants(
+        &mut self,
+        param: u32,
+        values: &[u32],
+        cache: bool,
+        emit: impl FnOnce(&[u32]),
+    ) {
+        if !cache {
+            emit(values);
+            return;
+        }
+        let Some(entry) = RootConstants::from_slice(values) else {
+            emit(values);
+            return;
+        };
+        let index = param as usize;
+        if index >= self.constants.len() {
+            self.constants.resize(index + 1, None);
+        }
+        if self.constants[index].is_some_and(|cached| cached.matches(values)) {
+            return;
+        }
+        emit(values);
+        self.constants[index] = Some(entry);
+    }
 }
 
 /// `VICTORY_ROOT_BIND_CACHE=1` omits repeated host `Set*Root*` calls when the
 /// exact resolved GPU address / descriptor handle / root constants are already
-/// bound on the open host list.
+/// bound on the open host list. Live-updatable from the F1 menu.
+fn root_bind_cache_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var_os("VICTORY_ROOT_BIND_CACHE").is_some_and(|v| v == "1"),
+        )
+    })
+}
+
 fn root_bind_cache() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BIND_CACHE").is_some_and(|v| v == "1"))
+    root_bind_cache_cell().load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_root_bind_cache_live(on: bool) {
+    root_bind_cache_cell().store(on, Ordering::Relaxed);
+    tracing::info!(on, "root bind cache: updated live from F1 menu");
 }
 
 fn bind_argument<T: PartialEq>(
@@ -1956,31 +2023,19 @@ impl State {
                     self.user.clear();
                     self.user.extend_from_slice(values);
                 }
-                if root_bind_cache() {
-                    bind_argument(
-                        &mut self.root_bindings[usize::from(compute)].constants,
-                        param,
-                        values.to_vec(),
-                        true,
-                        |values| unsafe {
-                            // SAFETY: an open list; `values` covers the parameter.
-                            if compute {
-                                l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                            } else {
-                                l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                            }
-                        },
-                    );
-                } else {
-                    // SAFETY: an open list; `values` covers the parameter.
-                    unsafe {
+                self.root_bindings[usize::from(compute)].bind_constants(
+                    param,
+                    values,
+                    root_bind_cache(),
+                    |values| unsafe {
+                        // SAFETY: an open list; `values` covers the parameter.
                         if compute {
                             l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                         } else {
                             l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                         }
-                    }
-                }
+                    },
+                );
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -3465,22 +3520,60 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{
+            AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, Views,
+        };
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
-        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        // Which surfaces the miss program's rays are of (its first root
+        // constant): water's reflections are left as they are (the depth
+        // here is of what lies under it).
+        let layer = match role {
+            Role::Miss => t
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Constants)
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Constants(c)) => c.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
+        // are of transparent surfaces (glass, foam, wakes on water) and the
+        // depth read is the opaque one behind them; outdoors on water that is
+        // the bottom, the reflected direction is wrong and the estimate dark.
+        let alpha_too = crate::ambient::specular_alpha();
+        if role == Role::Miss
+            && !(layer == crate::ambient::MISS_OPAQUE
+                || (alpha_too && layer == crate::ambient::MISS_ALPHA))
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
+        let Some(heap) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()
         else {
             return false;
         };
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
             t.used.iter().find(|u| {
-                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
             })?;
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            // A view of a texture the title placed in its memory is a placed
+            // record; its host texture is the one placed_texture names
+            // (port of VIctory-NVIDIA bda6e59, GPL-3.0-or-later).
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            let resource = match (kind, view) {
                 (ResourceType::Srv, View::Shader(r, _))
                 | (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
@@ -3499,14 +3592,88 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Reflect => REFLECTIONS,
+            Role::Miss => MISS_LIGHT,
         };
-        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+        // Reject stencil-plane SRVs so Resolve/Miss never read stencil as depth
+        // (port of VIctory-NVIDIA d226814, GPL-3.0-or-later).
+        fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT,
+                DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R24G8_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let image = match role {
+            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
+            _ => entry(ResourceType::Uav, at),
+        };
+        let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         };
-        let depth = match role {
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(
+                        ?role,
+                        ?at,
+                        "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)"
+                    );
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
+        let (depth, depth_size) = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let found = usual_depth(DEPTH).or_else(|| {
+                    scan(ResourceType::Srv, &|d| {
+                        depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height)
+                    })
+                });
+                let Some((seen, handle)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -3514,23 +3681,81 @@ impl State {
                     once!(?role, "no stand-in for the indirect light: depth dimensions differ");
                     return false;
                 }
-                Some(depth)
+                (Some(handle), [seen.Width as u32, seen.Height])
             }
-            Role::Radiance | Role::Air | Role::Reflect => None,
+            Role::Miss => {
+                let found = usual_depth(MISS_DEPTH)
+                    .filter(|(d, _)| {
+                        d.Width.abs_diff(of.Width * 2) <= 1
+                            && u64::from(d.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+                    })
+                    .or_else(|| {
+                        scan(ResourceType::Srv, &|d| {
+                            use windows::Win32::Graphics::Dxgi::Common::{
+                                DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                            };
+                            depth_like(d)
+                                && matches!(
+                                    d.Format,
+                                    DXGI_FORMAT_R32_TYPELESS
+                                        | DXGI_FORMAT_D32_FLOAT
+                                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                )
+                                && d.Width.abs_diff(of.Width * 2) <= 1
+                                && u64::from(d.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+                        })
+                    });
+                let Some((seen, handle)) = found else {
+                    once!(?role, "no stand-in for the indirect light: other tables");
+                    crate::ambient::note_miss(MissNote::NotReady);
+                    return false;
+                };
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                let valid = matches!(
+                    seen.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_R32_FLOAT
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                ) && seen.Width >= of.Width
+                    && seen.Height >= of.Height
+                    && seen.Width <= of.Width * 4;
+                if !valid {
+                    once!(?role, format = seen.Format.0, "no stand-in for the indirect light: another depth");
+                    crate::ambient::note_miss(MissNote::NotReady);
+                    return false;
+                }
+                (Some(handle), [seen.Width as u32, seen.Height])
+            }
+            Role::Radiance | Role::Air | Role::Reflect => (None, [of.Width as u32, of.Height]),
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
-        crate::ambient::after(list, role, &Views {
+        let ran = crate::ambient::after(list, role, &Views {
             image,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+            depth_size,
+        });
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4898,6 +5123,15 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            // Stand-in for reflections after CS_RayMiss (port of VIctory-NVIDIA 2db59d4).
+            if let Some(role @ crate::ambient::Role::Miss) =
+                p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
         }
@@ -5395,7 +5629,26 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{RootBindings, staging_budget_per_frame};
+
+    #[test]
+    fn inline_root_constants_cache_hits_misses_and_resets() {
+        let mut rb = RootBindings::default();
+        let mut emitted: Vec<Vec<u32>> = Vec::new();
+        rb.bind_constants(0, &[1, 2, 3], true, |v| emitted.push(v.to_vec()));
+        rb.bind_constants(0, &[1, 2, 3], true, |v| emitted.push(v.to_vec()));
+        assert_eq!(emitted.len(), 1);
+        rb.bind_constants(0, &[1, 2, 4], true, |v| emitted.push(v.to_vec()));
+        assert_eq!(emitted.len(), 2);
+        rb.bind_constants(0, &[1, 2], true, |v| emitted.push(v.to_vec()));
+        assert_eq!(emitted.len(), 3);
+        rb.clear();
+        rb.bind_constants(0, &[1, 2], true, |v| emitted.push(v.to_vec()));
+        assert_eq!(emitted.len(), 4);
+        // Cache off always emits.
+        rb.bind_constants(0, &[1, 2], false, |v| emitted.push(v.to_vec()));
+        assert_eq!(emitted.len(), 5);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

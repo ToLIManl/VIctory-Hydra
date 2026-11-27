@@ -65,12 +65,25 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
     /// Heap ranges whose `read_into` failed (e.g., momentarily unmapped during
     /// a remap race after the write-watch reset cleared their dirty bits) so
-    /// they are retried on the next sync. Guarded by `has_unread` for zero
-    /// lock overhead on the common empty path.
+    /// they are retried once a subsequent page map/remap bumps `REMAP_GEN`.
     #[cfg(windows)]
     unread: std::sync::Mutex<std::collections::BTreeSet<(usize, usize)>>,
     #[cfg(windows)]
     has_unread: std::sync::atomic::AtomicBool,
+    /// `REMAP_GEN` value observed when `unread` last failed; retries are skipped
+    /// until `REMAP_GEN` advances so permanently unmapped pages never spin.
+    #[cfg(windows)]
+    unread_gen: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(windows)]
+static REMAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Called whenever title memory pages are mapped, unmapped or remapped so
+/// deferred `unread` descriptor ranges are retried on the next sync.
+#[cfg(windows)]
+pub(crate) fn note_remap() {
+    REMAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -464,10 +477,12 @@ pub(crate) fn sync_heaps() {
                 }
             }
         }
-        // Retry any ranges whose `read_into` failed on an earlier sync (e.g.
-        // momentarily unmapped during a remap after write-watch reset cleared
-        // their dirty bits). Fast-path atomic avoids locking on the common empty case.
-        if heap.has_unread.swap(false, Relaxed) {
+        // Retry ranges whose `read_into` failed earlier only after title memory
+        // mapping generation advances (or if newly queued), avoiding repeated
+        // kernel read attempts on permanently unmapped pages.
+        let remap_gen = REMAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        if heap.has_unread.load(Relaxed) && heap.unread_gen.load(Relaxed) != remap_gen {
+            heap.has_unread.store(false, Relaxed);
             let mut unread = heap.unread.lock().unwrap_or_else(|e| e.into_inner());
             for (from, to) in std::mem::take(&mut *unread) {
                 parts.push((from, to, false));
@@ -605,6 +620,7 @@ pub(crate) fn sync_heaps() {
         if !unread_next.is_empty() {
             let mut unread = heap.unread.lock().unwrap_or_else(|e| e.into_inner());
             unread.extend(unread_next);
+            heap.unread_gen.store(remap_gen, Relaxed);
             heap.has_unread.store(true, Relaxed);
         }
         spent[1] += since(began);
@@ -1779,6 +1795,8 @@ pub(crate) extern "system" fn create_heap(
         unread: Default::default(),
         #[cfg(windows)]
         has_unread: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(windows)]
+        unread_gen: std::sync::atomic::AtomicU64::new(0),
     });
     // Renderer port #2: the title's own stores tell this heap's slots.
     #[cfg(windows)]

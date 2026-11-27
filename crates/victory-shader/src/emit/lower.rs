@@ -686,7 +686,15 @@ pub(super) fn loop_branches(p: &Program, st: &Structured) -> HashSet<usize> {
 /// Whether accesses outside a program's own shared memory are done as the console does them
 /// (reads give 0, writes are dropped; `VICTORY_LDS_BOUNDS=0`: taken as inside, as before).
 fn lds_bounds() -> bool {
-    !std::env::var("VICTORY_LDS_BOUNDS").is_ok_and(|v| v.trim() == "0")
+    #[cfg(test)]
+    {
+        !std::env::var("VICTORY_LDS_BOUNDS").is_ok_and(|v| v.trim() == "0")
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("VICTORY_LDS_BOUNDS").is_ok_and(|v| v.trim() == "0"))
+    }
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -1501,7 +1509,15 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
 /// Whether programs with console lanes in groups of several host waves take their console
 /// threads from a group counter (`ticket`). `VICTORY_THREAD_TICKET=0`: as before.
 fn ticket_on() -> bool {
-    std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
+    #[cfg(test)]
+    {
+        std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0"))
+    }
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -5495,7 +5511,20 @@ impl<'a> Lower<'a> {
         data: &[Operand],
         elements: &[(u32, u32)],
     ) -> Option<(V, Vec<(u32, u32)>)> {
-        if std::env::var("VICTORY_LDS_FIRST_INIT").is_ok_and(|v| v.trim() == "0") {
+        let first_init_on = {
+            #[cfg(test)]
+            {
+                !std::env::var("VICTORY_LDS_FIRST_INIT").is_ok_and(|v| v.trim() == "0")
+            }
+            #[cfg(not(test))]
+            {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| {
+                    !std::env::var("VICTORY_LDS_FIRST_INIT").is_ok_and(|v| v.trim() == "0")
+                })
+            }
+        };
+        if !first_init_on {
             return None;
         }
         let StageIo::Cs(cs) = self.x.native.io else { return None };
