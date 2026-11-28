@@ -1102,6 +1102,15 @@ pub(crate) fn ready(
     })
 }
 
+/// Removes a dropped [`crate::descriptor::host::HostHeap`]'s entry from
+/// [`Memory::heaps`] so its pointer can never collide with a new heap
+/// allocated at the same address and stale metadata never accumulates.
+pub(crate) fn release_heap(key: usize) {
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.

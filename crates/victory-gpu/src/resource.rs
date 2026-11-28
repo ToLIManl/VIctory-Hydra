@@ -1605,7 +1605,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly {
+                match host_texture_as(&r.desc, r.host.state, clear, true) {
+                    HostTextureAlloc::Made(t) => Some(t),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1629,12 +1636,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => HostTextureAlloc::Made(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match texture {
+            HostTextureAlloc::Made(texture) => texture,
+            // Speculative pool-gate refusal: defer without poisoning `refused`,
+            // so the texture can allocate once VRAM frees up.
+            HostTextureAlloc::Deferred => return None,
+            HostTextureAlloc::Failed => {
+                r.host.refused.store(true, Relaxed);
+                return None;
+            }
         };
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
@@ -1739,14 +1752,55 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room())
-                .saturating_add(crate::shadow::card_room_kept())
-                .saturating_add(targets_room_kept())
-                < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => weighed(budget, used) < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// One texture pool block (`crate::pool::BLOCK`).
+#[cfg(any(windows, test))]
+const POOL_BLOCK: u64 = 64 << 20;
+
+/// What [`room`] and [`let_go_idle`] weigh against the texture line: real DXGI
+/// usage minus free pool space, plus buffer and target reserves; when the pool
+/// gate ([`crate::pool::gate`]) refuses new blocks, clamps up to
+/// [`blocks_full`] so the sweep keeps a block's worth of free pieces inside
+/// existing blocks instead of deadlocking.
+#[cfg(windows)]
+fn weighed(budget: u64, used: u64) -> u64 {
+    let free = crate::pool::texture_room();
+    let by_use = used
+        .saturating_sub(free)
+        .saturating_add(crate::shadow::card_room_kept())
+        .saturating_add(targets_room_kept());
+    let line = budget / 100 * room_percent();
+    if crate::pool::gate() && !block_room(Some([budget, used, 0, 0])) {
+        by_use.max(blocks_full(line, free))
+    } else {
+        by_use
+    }
+}
+
+#[cfg(any(windows, test))]
+fn blocks_full(line: u64, free: u64) -> u64 {
+    line.saturating_add(POOL_BLOCK).saturating_sub(free)
+}
+
+/// Whether the card has room for one more 64 MiB texture pool block
+/// (`VICTORY_POOL_GATE`, ported from fxceless 2eade68).
+#[cfg(windows)]
+pub(crate) fn block_room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let kept = crate::shadow::card_room_kept().saturating_add(targets_room_kept());
+    let line = budget / 100 * room_percent();
+    let fits = filled < texture_floor_bytes(Some(budget))
+        || used.saturating_add(kept).saturating_add(POOL_BLOCK) <= line;
+    crate::pool::note_full(!fits);
+    fits
 }
 
 /// Looser VRAM threshold (97% of budget, ignoring texture-queue reserve)
@@ -2246,13 +2300,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used
-                .saturating_sub(crate::pool::texture_room())
-                .saturating_add(crate::shadow::card_room_kept())
-                .saturating_add(targets_room_kept());
-            crate::host::vram_keep(budget, used)
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, weighed(budget, used)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -2619,11 +2667,18 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
+enum HostTextureAlloc {
+    Made(windows::Win32::Graphics::Direct3D12::ID3D12Resource),
+    Deferred,
+    Failed,
+}
+
+#[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> HostTextureAlloc {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2635,13 +2690,15 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> HostTextureAlloc {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return HostTextureAlloc::Failed;
     }
-    let host = crate::host::host()?;
+    let Some(host) = crate::host::host() else {
+        return HostTextureAlloc::Failed;
+    };
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2700,19 +2757,26 @@ fn host_texture_as(
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+    {
         // SAFETY: the description has the host layout, as below.
-        && let Some(t) = unsafe {
+        match unsafe {
             crate::pool::texture(
                 &host.device,
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
             )
+        } {
+            crate::pool::TextureAlloc::Pooled(t) => {
+                crate::host::name(&t, || {
+                    format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
+                });
+                return HostTextureAlloc::Made(t);
+            }
+            // Refused by `VICTORY_POOL_GATE=1` under budget pressure: do NOT
+            // bypass the gate with `CreateCommittedResource`.
+            crate::pool::TextureAlloc::BudgetFull => return HostTextureAlloc::Deferred,
+            crate::pool::TextureAlloc::Fallback => {}
         }
-    {
-        crate::host::name(&t, || {
-            format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
-        });
-        return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2764,7 +2828,10 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    match texture {
+        Some(t) => HostTextureAlloc::Made(t),
+        None => HostTextureAlloc::Failed,
+    }
 }
 
 /// The host copy of title texture `this` if it is made and was made

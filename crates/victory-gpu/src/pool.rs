@@ -57,7 +57,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(STAGING_KEPT)
         };
         pool.reclaim(tick, staging_limit, true);
     }
@@ -82,6 +82,36 @@ fn now() -> u64 {
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether new 64 MiB texture pool blocks are gated at the VRAM texture line
+/// (`VICTORY_POOL_GATE=1` by default; `=0` disables, ported from fxceless 2eade68).
+/// Prevents fragmented pool blocks from pushing DXGI VRAM usage over budget
+/// during long sessions; speculative bindless textures reuse existing free
+/// ranges or wait, while table-bound draws and decoration bakes still succeed.
+pub(crate) fn gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GATE").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: texture blocks made, speculative blocks refused by
+/// [`gate`], and mandatory blocks made past the gate (table-bound / bake).
+pub(crate) static BLOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const BLOCK_MADE: usize = 0;
+const BLOCK_NOT_MADE: usize = 1;
+const BLOCK_PAST: usize = 2;
+
+/// True while the last [`crate::resource::block_room`] check found no room for
+/// another 64 MiB texture block.
+static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_full(full: bool) {
+    FULL.store(full, Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub(crate) fn full() -> bool {
+    gate() && FULL.load(Ordering::Relaxed)
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -493,8 +523,28 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     }
 }
 
-/// A texture of `desc` (no target, depth or unordered access) in a block;
-/// `None`: not pooled, or the host refused.
+/// Outcome of asking the texture pool for a placed texture.
+pub(crate) enum TextureAlloc {
+    /// Allocated in a pool block.
+    Pooled(ID3D12Resource),
+    /// Refused by `VICTORY_POOL_GATE=1` for a speculative texture because the
+    /// VRAM budget is full: callers must defer and retry later rather than
+    /// falling back to `CreateCommittedResource`.
+    BudgetFull,
+    /// Not pooled (pooling off, too big for a block, or creation failed):
+    /// callers may fall back to `CreateCommittedResource`.
+    Fallback,
+}
+
+#[cfg(test)]
+static TEST_GATE_FORCE_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_test_gate_force_full(full: bool) {
+    TEST_GATE_FORCE_FULL.store(full, Ordering::SeqCst);
+}
+
+/// A texture of `desc` (no target, depth or unordered access) in a block.
 ///
 /// # Safety
 /// `desc` is a valid description.
@@ -502,9 +552,9 @@ pub(crate) unsafe fn texture(
     device: &ID3D12Device,
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
-) -> Option<ID3D12Resource> {
+) -> TextureAlloc {
     if !on() {
-        return None;
+        return TextureAlloc::Fallback;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
     // (the top mip is 64 KiB at most): 64 KiB each otherwise.
@@ -518,10 +568,32 @@ pub(crate) unsafe fn texture(
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
     if info.SizeInBytes == u64::MAX {
-        return None;
+        return TextureAlloc::Fallback;
     }
+    #[cfg(test)]
+    let force_full = TEST_GATE_FORCE_FULL.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let force_full = false;
+    let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+    if force_full && speculative {
+        BLOCKS[BLOCK_NOT_MADE].fetch_add(1, Ordering::Relaxed);
+        note_full(true);
+        return TextureAlloc::BudgetFull;
+    }
+    let mut budget_full = false;
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let taken = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+        if gate() || force_full {
+            let mem = crate::host::host().and_then(|h| h.video_memory());
+            if force_full || !crate::resource::block_room(mem) {
+                if speculative {
+                    budget_full = true;
+                    BLOCKS[BLOCK_NOT_MADE].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                BLOCKS[BLOCK_PAST].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -540,8 +612,15 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
+        if heap.is_some() {
+            BLOCKS[BLOCK_MADE].fetch_add(1, Ordering::Relaxed);
+        }
         heap
-    })?;
+    });
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let Some((piece, heap, again)) = taken else {
+        return if budget_full { TextureAlloc::BudgetFull } else { TextureAlloc::Fallback };
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -569,11 +648,11 @@ pub(crate) unsafe fn texture(
                     )
                 });
             }
-            Some(made)
+            TextureAlloc::Pooled(made)
         }
         _ => {
             lock(&TEXTURES).give(piece, now());
-            None
+            TextureAlloc::Fallback
         }
     }
 }
@@ -723,7 +802,9 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let TextureAlloc::Pooled(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else {
+            return;
+        };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
@@ -744,5 +825,49 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// Regression test for `VICTORY_POOL_GATE=1`: when the VRAM budget is full
+    /// for a speculative texture (`PICKING` set, not `BAKING`), `pool::texture`
+    /// returns `TextureAlloc::BudgetFull` and `resource::host_copy` defers the
+    /// allocation without calling `CreateCommittedResource` and without setting
+    /// `refused`. Once budget pressure clears, retrying the exact same texture
+    /// allocates cleanly inside a pool block.
+    #[test]
+    fn pool_gate_defers_speculative_without_committed_fallback_and_retries_when_room_returns() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else { return };
+        let desc = [3u32, 0, 0, 0, 128, 0, 128, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: private committed buffer kept for the test.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: within allocation bounds.
+        unsafe { std::ptr::write_bytes(at, 0x3c, whole) };
+        let tex = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(tex, 0);
+
+        let before_not_made = BLOCKS[BLOCK_NOT_MADE].load(Ordering::Relaxed);
+        set_test_gate_force_full(true);
+        crate::texture::PICKING.set(Some(u64::MAX));
+        let deferred = crate::resource::host_copy(tex);
+        crate::texture::PICKING.set(None);
+        set_test_gate_force_full(false);
+
+        assert!(deferred.is_none(), "speculative texture under full pool gate must defer instead of CreateCommittedResource");
+        assert!(
+            BLOCKS[BLOCK_NOT_MADE].load(Ordering::Relaxed) > before_not_made,
+            "pool gate deferral counter should increment"
+        );
+        assert!(crate::resource::made_copy(tex).is_none(), "no committed fallback copy should exist");
+
+        // Once VRAM pressure clears, retrying the exact same texture must succeed
+        // in a pool block (proving `refused` was NOT latched on budget deferral).
+        crate::texture::PICKING.set(Some(u64::MAX));
+        let retried = crate::resource::host_copy(tex);
+        crate::texture::PICKING.set(None);
+        let copy = retried.expect("retry after VRAM frees must succeed");
+        assert!(fresh(&copy.texture), "retried copy should be allocated in a pool block");
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }

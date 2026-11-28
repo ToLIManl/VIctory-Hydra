@@ -46,25 +46,37 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
 }
 
+/// Completion state of callbacks registered on a [`Job`].
+enum Waiters {
+    /// Upload has not finished yet.
+    Pending(Vec<Box<dyn FnOnce() + Send>>),
+    /// Copy fence completed cleanly: descriptors may flip immediately.
+    Done,
+    /// Copy failed: never publish or flip descriptors; caller must retry.
+    Failed,
+}
+
 /// An upload on its way.
 pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
-    /// What to do when it has run; `None`: it has.
-    then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
+    /// What to do when the copy fence has completed.
+    then: Mutex<Waiters>,
 }
 
 impl Job {
-    /// Calls `f` when the copy has run: now if it has.
+    /// Calls `f` when the copy has run cleanly: now if it already succeeded,
+    /// or dropped without running if the copy failed.
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
-        match then.as_mut() {
-            Some(then) => then.push(Box::new(f)),
-            None => {
+        match &mut *then {
+            Waiters::Pending(list) => list.push(Box::new(f)),
+            Waiters::Done => {
                 drop(then);
                 f();
             }
+            Waiters::Failed => {}
         }
     }
 }
@@ -122,10 +134,12 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
+    // The `ahead` worker executes on a D3D12 COPY queue which cannot dispatch
+    // GPU compute detiling; always stage linear CPU-detiled footprints here.
+    let staging = super::staging_linear(resource, &copy, first);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+        !s.on_demand && !s.gpu_raw && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
@@ -133,7 +147,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
-    let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
+    let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Waiters::Pending(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
@@ -253,10 +267,8 @@ impl Worker {
                 }
             }
             value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
-            }
-            finish(jobs);
+            let res = self.copy(&jobs, value);
+            complete(jobs, res);
         }
     }
 
@@ -287,6 +299,11 @@ impl Job {
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
+        debug_assert!(!s.gpu_raw, "ahead copy queue cannot copy a gpu_raw staging buffer");
+        if s.gpu_raw {
+            tracing::error!("refusing copy-queue CopyTextureRegion from gpu_raw staging buffer");
+            return;
+        }
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -308,7 +325,37 @@ impl Job {
     }
 }
 
-/// The jobs' copies have run.
+/// Publishes a batch only after the COPY queue fence succeeds; on error, leaves
+/// the textures unuploaded and dirty so a subsequent attempt can retry safely.
+fn complete(jobs: Vec<Arc<Job>>, result: windows::core::Result<()>) {
+    match result {
+        Ok(()) => finish(jobs),
+        Err(e) => {
+            tracing::warn!(error = %e, count = jobs.len(), "uploads ahead did not run; leaving dirty for retry");
+            fail(jobs);
+        }
+    }
+}
+
+/// The jobs' copy failed before fence confirmation: do NOT mark uploaded,
+/// do NOT flip descriptors, and re-arm both staging and host copy for retry.
+fn fail(jobs: Vec<Arc<Job>>) {
+    for job in &jobs {
+        job.staging.dirty.store(true, Relaxed);
+        job.copy.ahead.store(NONE, Relaxed);
+        BYTES.fetch_sub(job.staging.read as u64, Relaxed);
+        let mut waiters = job.then.lock().unwrap_or_else(|e| e.into_inner());
+        *waiters = Waiters::Failed;
+    }
+    {
+        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+        IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
+        LANDED.notify_all();
+    }
+}
+
+/// The jobs' copies have run and their COPY fence completed cleanly.
 fn finish(jobs: Vec<Arc<Job>>) {
     for job in &jobs {
         job.staging.uploaded.store(true, Relaxed);
@@ -333,8 +380,14 @@ fn finish(jobs: Vec<Arc<Job>>) {
                 STATS[5].load(Relaxed)
             );
         }
-        let then = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
-        for f in then.into_iter().flatten() {
+        let then = {
+            let mut waiters = job.then.lock().unwrap_or_else(|e| e.into_inner());
+            match std::mem::replace(&mut *waiters, Waiters::Done) {
+                Waiters::Pending(list) => list,
+                Waiters::Done | Waiters::Failed => Vec::new(),
+            }
+        };
+        for f in then {
             f();
         }
     }
@@ -469,5 +522,233 @@ mod tests {
         assert!(drain() >= 1);
         assert!(ran.load(std::sync::atomic::Ordering::Acquire), "job.then callback must run before drain() returns");
         assert_eq!(drain(), 0);
+    }
+
+    /// Regression test for the STOP-sign / skin-stripe corruption bug:
+    /// when `VICTORY_GPU_DETILE=1` is active, `ahead` executes on a D3D12 COPY
+    /// queue (which cannot dispatch compute detiling), so it MUST still stage
+    /// linear CPU-detiled footprints rather than copying raw Xbox-tiled bytes.
+    #[test]
+    fn ahead_stays_linear_when_gpu_detile_is_enabled() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else { return };
+        let prev = crate::detile::on();
+        crate::detile::set_live(true);
+        // 256x256 BC7 (>= 16 KiB, eligible for gpu_raw), 9 levels.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: private allocation kept for the test.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: initialized within allocation bounds.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i.wrapping_mul(29) ^ (i >> 3)) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            crate::detile::set_live(prev);
+            return;
+        }
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else {
+            crate::detile::set_live(prev);
+            panic!("ahead should accept texture linearly even when gpu_detile is enabled");
+        };
+        assert!(!job.staging.gpu_raw, "ahead staging must never be gpu_raw");
+        send(&job);
+        assert!(drain() >= 1);
+        let layout = crate::resource::texture_memory(texture)
+            .and_then(|(_, d)| crate::resource::texture_layout(&d).map(|t| t.planes[0].layout.clone()))
+            .unwrap();
+        let (pitch, rows) = (1024usize, 64usize);
+        let mut expected = vec![0u8; pitch * rows];
+        // SAFETY: `at..at+whole` is live committed memory.
+        let tiled = unsafe { std::slice::from_raw_parts(at, whole) };
+        layout.detile(tiled, 0, 0, &mut expected, pitch, pitch * rows).unwrap();
+        let back = host.read_back_buffer((pitch * rows) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        list.close();
+        list.reset();
+        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(98),
+                Width: 256,
+                Height: 256,
+                Depth: 1,
+                RowPitch: pitch as u32,
+            },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed COM handle for command recording.
+            pResource: unsafe { std::mem::transmute_copy(&back) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed COM handle for command recording.
+            pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: open list and live resources.
+        unsafe {
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let seen = std::slice::from_raw_parts(data.cast::<u8>(), pitch * rows);
+            assert!(seen == expected.as_slice(), "ahead copy under VICTORY_GPU_DETILE=1 must match CPU detile bit-exact");
+            back.Unmap(0, None);
+        }
+        crate::detile::set_live(prev);
+    }
+
+    /// Regression test: if `Worker::copy` fails before the COPY fence completes,
+    /// `complete(..., Err)` must NOT mark `uploaded=true`, must leave `dirty=true`,
+    /// must NOT fire `then` callbacks (either registered before or after failure),
+    /// must reset `ahead` to `NONE`, and must allow a subsequent retry to upload
+    /// cleanly and fire callbacks.
+    #[test]
+    fn ahead_copy_error_does_not_publish_and_allows_retry() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else { return };
+        let desc = [3u32, 0, 0, 0, 128, 0, 128, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: private committed buffer kept for the test.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: within bounds.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i.wrapping_mul(17) ^ 0x55) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("initial claim failed") };
+        let flips = Arc::new(AtomicUsize::new(0));
+        let f1 = flips.clone();
+        job.then(move || {
+            f1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Simulate COPY queue / fence failure before ever calling `finish`.
+        complete(vec![job.clone()], Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)));
+
+        // Even a late `then` callback on the failed job must NOT publish/flip.
+        let f2 = flips.clone();
+        job.then(move || {
+            f2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(flips.load(std::sync::atomic::Ordering::SeqCst), 0, "failed copy must never fire descriptor flip");
+        assert!(!job.staging.uploaded.load(Relaxed), "failed copy must not set uploaded=true");
+        assert!(job.staging.dirty.load(Relaxed), "failed copy must leave dirty=true for retry");
+        assert!(!there(texture), "failed copy must not mark ahead=DONE");
+        assert_eq!(copy.ahead.load(Relaxed), NONE, "failed copy must reset ahead to NONE");
+
+        // Retry via normal claim + send must succeed and publish cleanly.
+        let Some(Taken::New(retry_job)) = claim(texture, 0, u64::MAX) else {
+            panic!("retry claim after failed copy should succeed");
+        };
+        let f3 = flips.clone();
+        retry_job.then(move || {
+            f3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        send(&retry_job);
+        assert!(drain() >= 1);
+        assert_eq!(flips.load(std::sync::atomic::Ordering::SeqCst), 1, "retried copy must fire descriptor flip once");
+        assert!(retry_job.staging.uploaded.load(Relaxed));
+        assert!(!retry_job.staging.dirty.load(Relaxed));
+        assert!(there(texture));
+        // SAFETY: plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Regression test: a multi-mip BC7 texture (256x256, 9 mips) whose first
+    /// ahead upload errors out must retry cleanly and deliver bit-exact pixels
+    /// across multiple mip levels (mips 0..=3) on the GPU.
+    #[test]
+    fn ahead_multimip_error_and_retry_uploads_all_mips_bit_exact() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else { return };
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: private committed buffer kept for the test.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: within bounds.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i.wrapping_mul(31).wrapping_add(i >> 5)) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let Some(Taken::New(first_job)) = claim(texture, 0, u64::MAX) else { panic!("claim failed") };
+        assert_eq!(first_job.staging.footprints.len(), 9, "expected all 9 mip levels in staging");
+        complete(vec![first_job.clone()], Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL)));
+        assert!(!there(texture));
+        assert!(!first_job.staging.uploaded.load(Relaxed));
+        assert!(first_job.staging.dirty.load(Relaxed));
+
+        let Some(Taken::New(retry_job)) = claim(texture, 0, u64::MAX) else { panic!("retry claim failed") };
+        send(&retry_job);
+        assert!(drain() >= 1);
+        assert!(there(texture));
+
+        let layout = crate::resource::texture_memory(texture)
+            .and_then(|(_, d)| crate::resource::texture_layout(&d).map(|t| t.planes[0].layout.clone()))
+            .unwrap();
+        // SAFETY: live committed memory.
+        let tiled = unsafe { std::slice::from_raw_parts(at, whole) };
+        for mip in 0u32..4 {
+            let dim = 256u32 >> mip;
+            let blocks_x = (dim / 4).max(1) as usize;
+            let blocks_y = (dim / 4).max(1) as usize;
+            let raw_row = blocks_x * 16;
+            let pitch = raw_row.next_multiple_of(256);
+            let mut expected = vec![0u8; pitch * blocks_y];
+            layout.detile(tiled, mip, 0, &mut expected, pitch, pitch * blocks_y).unwrap();
+            let back = host.read_back_buffer((pitch * blocks_y) as u64).unwrap();
+            let list = host.new_list().unwrap();
+            list.close();
+            list.reset();
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(98),
+                    Width: dim,
+                    Height: dim,
+                    Depth: 1,
+                    RowPitch: pitch as u32,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed handle.
+                pResource: unsafe { std::mem::transmute_copy(&back) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed handle.
+                pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip },
+            };
+            // SAFETY: open list and live resources.
+            unsafe {
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.close();
+                host.execute(&[&list]);
+                let mut data = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut data)).unwrap();
+                let seen = std::slice::from_raw_parts(data.cast::<u8>(), pitch * blocks_y);
+                for row in 0..blocks_y {
+                    let s = &seen[row * pitch..row * pitch + raw_row];
+                    let e = &expected[row * pitch..row * pitch + raw_row];
+                    assert_eq!(s, e, "mip {mip} row {row} mismatch after error+retry");
+                }
+                back.Unmap(0, None);
+            }
+        }
     }
 }

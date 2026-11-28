@@ -959,11 +959,11 @@ fn upload_from_inner(
     };
     let texture = &copy.texture;
     ahead::listed(copy);
-    let Some(staging) = staging(resource, copy, first) else {
+    let baking = BAKING.get();
+    let Some(staging) = staging_with(resource, copy, first, !baking) else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
-    let baking = BAKING.get();
     if baking {
         staging.exact.store(true, Relaxed);
     }
@@ -1219,6 +1219,11 @@ fn record_upload(
     source: &ID3D12Resource,
     base: u64,
 ) {
+    debug_assert!(!staging.gpu_raw, "record_upload cannot linearly copy a gpu_raw staging buffer");
+    if staging.gpu_raw {
+        tracing::error!(?resource, "refusing linear record_upload of gpu_raw staging buffer");
+        return;
+    }
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
@@ -2225,8 +2230,24 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The staging state of a title texture, made on first use with linear CPU
+/// detiling (`gpu_raw = false`) for copy-queue `ahead` uploads and synchronous
+/// decoration bakes that cannot run compute detiling.
+fn staging_linear(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    staging_with(resource, copy, first, false)
+}
+
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+/// When `allow_gpu_raw` is false (e.g. `ahead` copy queue or synchronous
+/// `BAKING` uploads), an existing `gpu_raw` staging entry is replaced with a
+/// linear CPU-detiled staging buffer so raw Xbox-tiled bytes are never copied
+/// linearly into a host texture.
+fn staging_with(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+    first: u32,
+    allow_gpu_raw: bool,
+) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
@@ -2236,6 +2257,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
+        && (!s.gpu_raw || allow_gpu_raw)
     {
         return Some(s.clone());
     }
@@ -2280,7 +2302,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let gpu_raw = !BAKING.get()
+    let gpu_raw = allow_gpu_raw
+        && !BAKING.get()
         && crate::detile::on()
         && crate::detile::eligible(&layout, on_demand, total, read);
     let alloc_bytes = if gpu_raw {

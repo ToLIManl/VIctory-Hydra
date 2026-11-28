@@ -702,7 +702,7 @@ mod tests {
         };
         // SAFETY: a valid description.
         let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
-        if let Some(texture) = texture {
+        if let crate::pool::TextureAlloc::Pooled(texture) = texture {
             let at = texture_address(&texture, &desc);
             println!("address {at:x?}");
             if let Some(at) = at {
