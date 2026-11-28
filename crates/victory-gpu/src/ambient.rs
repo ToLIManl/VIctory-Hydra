@@ -369,14 +369,23 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
+groupshared float3 g_mean[64];
 [RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void mean() {
+[numthreads(64, 1, 1)]
+void mean(uint gi : SV_GroupIndex) {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
-    float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    for (uint i = gi; i < CELLS; i += 64) sum += cells[i].rgb;
+    g_mean[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (gi < s) g_mean[gi] += g_mean[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        float4 was = cells[CELLS];
+        float3 now = g_mean[0] / CELLS;
+        cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    }
 }
 #endif
 
@@ -391,35 +400,50 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+groupshared float4 g_pos[128];
+groupshared float4 g_col[128];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
+[numthreads(16, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    bool valid = (at.x < PX && at.y < PY);
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float3 p = valid ? seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size) : float3(0.0, 0.0, 1.0);
     float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float r2_q = 0.25 * r2;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    // CELLS = 64 * 36 = 2304 = 18 * 128 exact tiles; 128x less global bandwidth.
+    for (uint base = 0; base < CELLS; base += 128) {
+        g_pos[gi] = cells[CELLS + 1 + base + gi];
+        g_col[gi] = cells[base + gi];
+        GroupMemoryBarrierWithGroupSync();
+        if (valid) {
+            [unroll(8)]
+            for (uint j = 0; j < 128; j++) {
+                float4 c = g_pos[j];
+                float3 L = g_col[j].rgb;
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 wdir = d * (w * rsqrt(dd + r2_q));
+                whole += w;
+                toward += wdir;
+                light += w * L;
+                red += L.r * wdir;
+                green += L.g * wdir;
+                blue += L.b * wdir;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-    whole = max(whole, 1e-6);
-    light /= whole;
-    toward /= whole;
+    if (!valid) return;
+    float inv_whole = 1.0 / max(whole, 1e-6);
+    light *= inv_whole;
+    toward *= inv_whole;
     uint at0 = (at.y * PX + at.x) * 3;
-    points[at0] = float4(red / whole - light.r * toward, light.r);
-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    points[at0] = float4(red * inv_whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green * inv_whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue * inv_whole - light.b * toward, light.b);
 }
 #endif
 
@@ -565,13 +589,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
         float sum = 0.0;
         const int N = 12;
+        float inv_r2 = 1.0 / max(radius * radius, 1e-6);
         for (int i = 0; i < N; i++) {
             float a = i * 2.399963 + noise * 6.2831853;
-            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+            float sa, ca;
+            sincos(a, sa, ca);
+            float2 o = float2(ca, sa) * (sqrt((i + 0.5) / N) * px);
             float3 v = seen(p + int2(round(o)), size) - c;
             float vv = dot(v, v);
             float over = dot(v, n) - 0.004 * c.z - 0.005;
-            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+            sum += max(over, 0.0) * rsqrt(vv + 1e-6) * saturate(1.0 - vv * inv_r2);
         }
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
@@ -927,7 +954,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run(&pass.gather, 10, 12, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
@@ -935,7 +962,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 // The points afresh, from this frame's depth: the diffuse
                 // stand-in makes them later in the frame.
                 run(&pass.place, 8, 9, 1);
-                run(&pass.gather, 20, 45, 1);
+                run(&pass.gather, 10, 12, 1);
                 run(&pass.specular, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }

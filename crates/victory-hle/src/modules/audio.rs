@@ -29,7 +29,11 @@ use crate::{HleModule, hle_export};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
 
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
+/// `acphal.h:45-60` ACP HAL error codes.
+const ACP_E_ALREADY_ALLOCATED: HRESULT = 0x8AC8_0001_u32 as i32;
+const ACP_E_NOT_ALLOCATED: HRESULT = 0x8AC8_0002_u32 as i32;
+const ACP_E_ALREADY_CONNECTED: HRESULT = 0x8AC8_0009_u32 as i32;
+const ACP_E_NOT_CONNECTED: HRESULT = 0x8AC8_000A_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -237,9 +241,10 @@ pub struct ShapeContexts {
     apu: [u32; 6],
 }
 
-/// Bytes per context: rate conversion, DMA and XMA as fmod clears them;
-/// the others (not seen yet) get a generous upper bound.
-const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
+/// Bytes per context (`ShapeSrcContext.h:62`, `ShapeEqCompContext.h:174`,
+/// `ShapeFiltVolContext.h:71`, `ShapeDmaContext.h:96`, `shapexmacontext.h:108`,
+/// `ShapePcmContext.h:71`): SRC=32, EQComp=160, FiltVol=32, DMA=16, XMA=64, PCM=32.
+const CONTEXT_BYTES: [usize; 6] = [32, 160, 32, 16, 64, 32];
 
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
@@ -249,7 +254,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     }
     let mut allocated = lock(&CONTEXTS);
     if allocated.is_some() {
-        return E_FAIL;
+        return ACP_E_ALREADY_ALLOCATED;
     }
     // SAFETY: the title passes its request; packed fields are copied out.
     let counts = unsafe { std::ptr::addr_of!((*contexts).counts).read_unaligned() };
@@ -284,7 +289,7 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
             arrays.iter().for_each(|&p| heap_free(p as *mut u8));
             S_OK
         }
-        None => E_FAIL,
+        None => ACP_E_NOT_ALLOCATED,
     }
 }
 
@@ -826,6 +831,9 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
         return E_INVALIDARG;
     }
     let mut state = state(this);
+    if state.connected {
+        return ACP_E_ALREADY_CONNECTED;
+    }
     state.connected = true;
     state.capacity = messages as usize;
     S_OK
@@ -834,7 +842,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
 extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
     let mut state = state(this);
     if !state.connected {
-        return E_FAIL;
+        return ACP_E_NOT_CONNECTED;
     }
     state.post(DISCONNECTED, &[]);
     state.connected = false;

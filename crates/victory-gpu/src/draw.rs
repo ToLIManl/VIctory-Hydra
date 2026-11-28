@@ -581,6 +581,8 @@ pub(crate) struct State {
     /// the indirect light follows (`crate::ambient`): root parameter, bytes
     /// into the view heap.
     ambient_tables: Vec<(u8, u32)>,
+    /// Cached host VRS key last bound on this list (`crate::vrs`).
+    vrs_key: u64,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1995,6 +1997,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        let (vp_w, vp_h) = self
+            .viewports
+            .first()
+            .map_or((0, 0), |v| (v.Width.max(0.0) as u32, v.Height.max(0.0) as u32));
+        crate::vrs::apply_for_draw(list, self.targets.len(), vp_w, vp_h, &mut self.vrs_key);
         let l = &list.list;
         // Draw after draw binds the same buffers: while the list's epoch,
         // its refresh generation and the buffer map are unchanged, a range
@@ -3765,16 +3772,28 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        let (gpu_hash, gpu_w64) = if crate::gpu_prof::capturing() {
+            pipeline_gpu_tag(p)
+        } else {
+            (0, false)
+        };
+        let gpu_tok = crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Cs, gpu_hash, gpu_w64);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        crate::gpu_prof::end(&list.list, gpu_tok);
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        FRAME_DRAWS.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
-            && self.ambient(list, p, role)
         {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            let amb_tok = crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Ambient, gpu_hash, false);
+            let amb_ran = self.ambient(list, p, role);
+            crate::gpu_prof::end(&list.list, amb_tok);
+            if amb_ran {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         }
     }
 
@@ -4294,6 +4313,13 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    let gpu_tok = if crate::gpu_prof::capturing() {
+                        let (h, w64) = crate::pipeline::host_pipeline(self.pipeline as This)
+                            .map_or((0, false), pipeline_gpu_tag);
+                        crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Mesh, h, w64)
+                    } else {
+                        None
+                    };
                     // With the launch stage the count goes to it as a root
                     // constant (`crate::launch`).
                     match launch {
@@ -4317,9 +4343,11 @@ impl State {
                         // SAFETY: an open list with everything set.
                         None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
                     }
+                    crate::gpu_prof::end(&list.list, gpu_tok);
                     self.drew_bound();
                     self.mesh_scissor(list, false);
                     count_drawn();
+                    FRAME_DRAWS.fetch_add(1, Ordering::Relaxed);
                     true
                 }
                 Err(_) => false,
@@ -4898,13 +4926,22 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let gpu_tok = if crate::gpu_prof::capturing() {
+                let (h, w64) = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or((0, false), pipeline_gpu_tag);
+                crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Draw, h, w64)
+            } else {
+                None
+            };
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            crate::gpu_prof::end(&list.list, gpu_tok);
             self.drew_bound();
             count_drawn();
+            FRAME_DRAWS.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
             count_dropped();
@@ -5029,13 +5066,22 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            let gpu_tok = if crate::gpu_prof::capturing() {
+                let (h, w64) = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or((0, false), pipeline_gpu_tag);
+                crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Indexed, h, w64)
+            } else {
+                None
+            };
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            crate::gpu_prof::end(&list.list, gpu_tok);
             self.drew_bound();
             count_drawn();
+            FRAME_DRAWS.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
             count_dropped();
@@ -5064,6 +5110,24 @@ impl State {
             self.prof_record(started, compute);
         }
     }
+}
+
+static FRAME_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns and resets the draw/dispatch count since the previous present.
+pub(crate) fn frame_draws_snapshot() -> u64 {
+    FRAME_DRAWS.swap(0, Ordering::Relaxed)
+}
+
+#[cold]
+fn pipeline_gpu_tag(p: &HostPipeline) -> (u64, bool) {
+    let hash = p
+        .stages
+        .last()
+        .and_then(|stage| u64::from_str_radix(&stage.shader.hash, 16).ok())
+        .unwrap_or(0);
+    let w64 = p.stages.iter().any(|stage| stage.shader.native_wave64);
+    (hash, w64)
 }
 
 /// With `crate::prof` on: `Some`, holding a clock started for 1 call in
@@ -5425,6 +5489,12 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        let gpu_tok = if crate::gpu_prof::capturing() {
+            let (h, w64) = pipeline_gpu_tag(p);
+            crate::gpu_prof::begin(&list.list, crate::gpu_prof::PassKind::Indirect, h, w64)
+        } else {
+            None
+        };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -5437,6 +5507,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        crate::gpu_prof::end(&list.list, gpu_tok);
+        FRAME_DRAWS.fetch_add(1, Ordering::Relaxed);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

@@ -77,11 +77,69 @@ impl Rec {
             held.0.clear();
             STATS[1].fetch_add(1, Relaxed);
         }
-        // SAFETY: a plain copy of the descriptions; nothing is released
-        // through them (their pointers are borrowed, `ManuallyDrop`).
-        held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
+        for b in barriers {
+            if let Some(uav_ptr) = uav_resource(b) {
+                // If a global UAV barrier (`None`) is already queued with no
+                // commands between, every subsequent UAV barrier is redundant.
+                if held.0.iter().any(|h| uav_resource(h) == Some(0)) {
+                    continue;
+                }
+                if uav_ptr == 0 {
+                    // A global UAV barrier supersedes any narrower UAV barriers
+                    // queued in the same batch (no commands ran between them).
+                    held.0.retain(|h| uav_resource(h).is_none());
+                } else if held.0.iter().any(|h| uav_resource(h) == Some(uav_ptr)) {
+                    continue;
+                }
+            }
+            // SAFETY: a plain copy of the description; nothing is released
+            // through it (its pointers are borrowed, `ManuallyDrop`).
+            held.0.push(unsafe { std::ptr::read(b) });
+        }
         STATS[0].fetch_add(1, Relaxed);
-        self.any.store(true, Relaxed);
+        if !held.0.is_empty() {
+            self.any.store(true, Relaxed);
+        }
+    }
+
+    /// Emits a scoped D3D12 Enhanced Global Barrier (`ID3D12GraphicsCommandList7::Barrier`)
+    /// after flushing any held legacy barriers, falling back to a global legacy UAV barrier
+    /// when Enhanced Barriers are unavailable.
+    ///
+    /// # Safety
+    /// As `Barrier`'s: an open command list.
+    pub(crate) unsafe fn global_barrier(&self, barrier: D3D12_GLOBAL_BARRIER) {
+        use windows::core::Interface;
+        if self.any.load(Relaxed) {
+            self.flush();
+        }
+        if crate::host::host_made().is_some_and(crate::host::Host::enhanced_barriers_supported)
+            && let Ok(list7) = self.list.cast::<ID3D12GraphicsCommandList7>()
+        {
+            let group = [D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pGlobalBarriers: &barrier,
+                },
+            }];
+            // SAFETY: open list supporting ID3D12GraphicsCommandList7 + EnhancedBarriersSupported.
+            unsafe { list7.Barrier(&group) };
+            STATS[0].fetch_add(1, Relaxed);
+            STATS[1].fetch_add(1, Relaxed);
+            return;
+        }
+        let uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: fallback legacy UAV barrier on an open list.
+        unsafe { self.barriers(&[uav]) };
     }
 
     /// What is held goes to the list, in one call.
@@ -112,6 +170,24 @@ fn named(b: &D3D12_RESOURCE_BARRIER) -> Option<usize> {
     }
 }
 
+/// For a UAV barrier, returns `Some(ptr)` (`0` for a global `NULL` UAV barrier);
+/// `None` for transition/aliasing barriers.
+fn uav_resource(b: &D3D12_RESOURCE_BARRIER) -> Option<usize> {
+    if b.Type != D3D12_RESOURCE_BARRIER_TYPE_UAV {
+        return None;
+    }
+    // SAFETY: `Type == UAV` selects the `UAV` union field; read raw pointer without cloning.
+    unsafe {
+        Some(
+            b.Anonymous
+                .UAV
+                .pResource
+                .as_ref()
+                .map_or(0, |r| windows::core::Interface::as_raw(r) as usize),
+        )
+    }
+}
+
 impl std::ops::Deref for Rec {
     type Target = ID3D12GraphicsCommandList;
 
@@ -131,5 +207,38 @@ pub(crate) fn line(frames: f64) {
         tracing::info!(
             "barrier calls per frame (VICTORY_JOIN_BARRIERS): {asked:.0} asked for, {made:.0} made of them"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uav(ptr: usize) -> D3D12_RESOURCE_BARRIER {
+        let mut b = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            ..Default::default()
+        };
+        // SAFETY: constructing a raw-pointer UAV barrier for unit-testing `uav_resource`.
+        unsafe {
+            let slot: *mut usize = (&raw mut (*b.Anonymous.UAV).pResource).cast();
+            slot.write(ptr);
+        }
+        b
+    }
+
+    #[test]
+    fn uav_resource_distinguishes_global_scoped_and_transition() {
+        let global = uav(0);
+        let scoped = uav(0x1234_5678);
+        let trans = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            ..Default::default()
+        };
+        assert_eq!(uav_resource(&global), Some(0));
+        assert_eq!(uav_resource(&scoped), Some(0x1234_5678));
+        assert_eq!(uav_resource(&trans), None);
     }
 }

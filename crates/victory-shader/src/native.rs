@@ -565,6 +565,62 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     })
 }
 
+/// Packs the separate components of a serialized Xbox Series compute pipeline
+/// (`D3D12XBOX_DESERIALIZE_COMPUTE_PIPELINE_STATE`: packet, pipeline metadata,
+/// CS GFX10 instructions, CS program metadata) into an `FSPX` (`XPSF`) blob
+/// inside a `DXBC` container's `ACCC` part, matching `aco_compute_pso.h`.
+///
+/// Validates the assembled `FSPX` payload through [`fspx_program`] so an
+/// unrecognized or non-FSPX metadata format fails cleanly instead of producing
+/// a broken container.
+pub fn pack_fspx_compute(
+    packet: &[u8],
+    pso_metadata: &[u8],
+    cs_isa: &[u8],
+    cs_meta: &[u8],
+) -> Result<Vec<u8>, ShaderError> {
+    if packet.is_empty() || cs_isa.is_empty() || cs_meta.is_empty() {
+        return Err(Malformed("deserialized compute PSO missing required section"));
+    }
+    const FSPX_PSO_METADATA: u32 = 1;
+    let mut entries: Vec<(u32, &[u8])> = Vec::with_capacity(4);
+    entries.push((FSPX_PACKET, packet));
+    if !pso_metadata.is_empty() {
+        entries.push((FSPX_PSO_METADATA, pso_metadata));
+    }
+    entries.push((FSPX_CODE, cs_isa));
+    entries.push((FSPX_METADATA, cs_meta));
+
+    let header_and_table = FSPX_HEADER + entries.len() * 16;
+    let payload_len: usize = entries.iter().map(|(_, b)| b.len()).sum();
+    let total = header_and_table
+        .checked_add(payload_len)
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or(Malformed("deserialized compute PSO too large"))?;
+
+    let mut fspx = Vec::with_capacity(total);
+    fspx.extend_from_slice(b"FSPX");
+    fspx.extend_from_slice(&FSPX_VERSION.to_le_bytes());
+    fspx.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    fspx.extend_from_slice(&(total as u32).to_le_bytes());
+
+    let mut offset = header_and_table;
+    for &(kind, bytes) in &entries {
+        fspx.extend_from_slice(&kind.to_le_bytes());
+        fspx.extend_from_slice(&(offset as u32).to_le_bytes());
+        fspx.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        offset += bytes.len();
+    }
+    for &(_, bytes) in &entries {
+        fspx.extend_from_slice(bytes);
+    }
+
+    // Confirm the assembled FSPX blob parses cleanly before wrapping in DXBC.
+    let _ = fspx_program(&fspx)?;
+    Ok(crate::dxbc::build(&[(crate::dxbc::FourCC::ACCC, &fspx)]))
+}
+
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
     data.get(at..at + 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -1250,5 +1306,52 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    #[test]
+    fn pack_fspx_compute_round_trips_into_native_program() {
+        let mut packet = [0u8; 0x1c];
+        // threads = [8, 8, 1], wave32 flag (bit 4), rsrc1 = 3 granules (32 VGPRs), rsrc2 = 0x182
+        packet[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        packet[0x0e..0x10].copy_from_slice(&8u16.to_le_bytes());
+        packet[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        packet[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        packet[0x14..0x18].copy_from_slice(&3u32.to_le_bytes());
+        packet[0x18..0x1c].copy_from_slice(&0x182u32.to_le_bytes());
+
+        let cs_isa = [0xBF81_0000u32.to_le_bytes()].concat(); // s_endpgm (1 dword)
+        let mut cs_meta = vec![0u8; 0x18 + 32];
+        cs_meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        cs_meta[8..12].copy_from_slice(&1u32.to_le_bytes()); // 1 code dword
+        // One 0x41 resource record (UAV table at slot 2, user_data 1, register 0)
+        let rec = &mut cs_meta[0x18..0x18 + 32];
+        rec[0] = 0x41;
+        rec[4] = 3; // UAV
+        rec[5] = 3; // Table
+        rec[20] = 8; // dwords
+        rec[21] = 1; // user_data
+        rec[22] = 2; // slot
+
+        let container = pack_fspx_compute(&packet, &[0xaa; 0x14], &cs_isa, &cs_meta).unwrap();
+        let parsed = crate::dxbc::Container::parse(&container).unwrap();
+        let accc = parsed.part(crate::dxbc::FourCC::ACCC).unwrap();
+        let progs = native_programs(accc.data).unwrap();
+        assert_eq!(progs.len(), 1);
+        assert_eq!(progs[0].stage, HwStage::Cs);
+        assert!(!progs[0].wave64);
+        assert_eq!(progs[0].vgprs, 32);
+        assert_eq!(progs[0].code, cs_isa);
+        assert_eq!(progs[0].used.len(), 1);
+        assert_eq!(progs[0].used[0].kind, ResourceType::Uav);
+        assert_eq!(progs[0].used[0].slot, 2);
+        assert_eq!(
+            progs[0].io,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0x182,
+                threads: [8, 8, 1],
+            })
+        );
+        // Rejects mismatched ISA size
+        assert!(pack_fspx_compute(&packet, &[], &[0u8; 8], &cs_meta).is_err());
     }
 }

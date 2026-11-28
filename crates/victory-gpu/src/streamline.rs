@@ -1163,7 +1163,10 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         }
         textures[i] = Some((texture, legal));
     }
-    let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
+    let gpu_tok = crate::gpu_prof::begin(&host.list, crate::gpu_prof::PassKind::Dlss, 0, false);
+    let recorded = record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id);
+    crate::gpu_prof::end(&host.list, gpu_tok);
+    let recorded = match recorded {
         Ok(recorded) => recorded,
         Err(why) => return fail(&why),
     };

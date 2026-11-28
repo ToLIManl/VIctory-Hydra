@@ -598,6 +598,13 @@ impl Module {
         }
         if passes & DEAD != 0 {
             self.drop_dead();
+            if passes & BARRIERS != 0 {
+                // `drop_dead` can remove dead LDS loads between two barriers
+                // (e.g. unused wave64 ballot exchanges), leaving literal
+                // back-to-back `dx.op.barrier` calls. Collapse adjacent covered
+                // barriers without re-running read-after-read coalescing.
+                self.drop_adjacent_barriers();
+            }
         }
     }
 
@@ -2859,6 +2866,52 @@ impl Module {
         }
         self.drop_unused_functions();
         self.drop_unused_tables();
+    }
+
+    /// Removes immediately adjacent covered `dx.op.barrier` calls exposed after
+    /// [`Self::drop_dead`] deletes dead loads between them.
+    fn drop_adjacent_barriers(&mut self) {
+        let effects = self.effects();
+        let barrier_mode = |m: &Module, i: u32| -> Option<u64> {
+            let Op::Call(f, args) = &m.insts[i as usize].op else {
+                return None;
+            };
+            if m.funcs[*f as usize].name != "dx.op.barrier" || args.len() != 2 {
+                return None;
+            }
+            let V::Const(c) = args[1] else {
+                return None;
+            };
+            match m.consts[c as usize].1 {
+                Const::Int(v) => Some(v as u64),
+                _ => None,
+            }
+        };
+        let mut kept = Vec::new();
+        for b in 0..self.blocks.len() {
+            let body = std::mem::take(&mut self.blocks[b].body);
+            kept.clear();
+            let mut prev: Option<u64> = None;
+            for i in body {
+                if let Some(mode) = barrier_mode(self, i) {
+                    if prev.is_some_and(|p| (p & mode) == mode) {
+                        continue;
+                    }
+                    prev = Some(mode);
+                } else {
+                    let pure = match &self.insts[i as usize].op {
+                        Op::Load(_) | Op::Store(..) | Op::AtomicRmw(..) => false,
+                        Op::Call(f, _) => effects[*f as usize] == Effect::Pure,
+                        _ => true,
+                    };
+                    if !pure {
+                        prev = None;
+                    }
+                }
+                kept.push(i);
+            }
+            self.blocks[b].body = kept.clone();
+        }
     }
 
     /// See [`Usage`]: over the blocks reached from the entry.

@@ -124,6 +124,7 @@ const ITEMS: &[Item] = &[
         label: "DLSS MODEL PRESET",
         values: &[
             ("", "DEFAULT"),
+            ("e", "E (DLSS 3 CNN)"),
             ("k", "K (DLSS 4)"),
             ("j", "J (DLSS 4)"),
             ("m", "M"),
@@ -191,10 +192,23 @@ const ITEMS: &[Item] = &[
         live: true,
     },
     Item {
+        var: "VICTORY_VRS",
+        label: "VARIABLE RATE SHADING",
+        values: &[
+            ("0", "OFF"),
+            ("soft", "SOFT (TIER2)"),
+            ("title", "TITLE"),
+            ("1x2", "1X2"),
+            ("2x2", "2X2"),
+        ],
+        live: true,
+    },
+    Item {
         var: "VICTORY_LOW_SHADOWS",
         label: "RAGE9 SHADOW MAPS",
         values: &[
             ("0", "STOCK (CONSOLE)"),
+            ("1536", "OPT 1536PX"),
             ("1", "LOW 1280PX"),
             ("2", "ULTRA-LOW 1024PX"),
         ],
@@ -1050,6 +1064,9 @@ pub(crate) fn apply_live_var(var: &str, value: &str) -> Result<(), &'static str>
         }
         "VICTORY_PROF" => {
             crate::prof::set_live(value == "1");
+        }
+        "VICTORY_VRS" => {
+            crate::vrs::set_live(value);
         }
         other => {
             if ITEMS.iter().any(|item| item.var == other)

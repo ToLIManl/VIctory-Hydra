@@ -1574,3 +1574,204 @@ fn lds_unresolved_write_only_refused_under_analyze_and_allowed_under_write_only_
         &out[0][..8]
     );
 }
+
+/// Optional end-to-end Scarlett `xdxc.exe` -> RDNA2 `ACCC` -> `victory-shader::emit::translate`
+/// -> D3D12 hardware execution test across both Wave64 (default) and Wave32
+/// (`-D__XBOX_ENABLE_WAVE32=1`), gated on `VICTORY_GDKX_TOOLS_DIR`.
+#[test]
+#[cfg(windows)]
+fn scarlett_xdxc_wave64_and_wave32_compute_shaders_execute_bit_exact_if_present() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let Some(dir) = std::env::var_os("VICTORY_GDKX_TOOLS_DIR") else {
+        return;
+    };
+    let xdxc = PathBuf::from(dir).join("xdxc.exe");
+    if !xdxc.is_file() {
+        return;
+    }
+
+    let cases: [(&str, &str, [u32; 64]); 3] = [
+        (
+            "lds_cross_half_exchange",
+            r#"
+RWByteAddressBuffer OutBuf : register(u0);
+groupshared uint s_data[64];
+
+[RootSignature("DescriptorTable(UAV(u0))")]
+[numthreads(64, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID)
+{
+    uint lane = gtid.x;
+    s_data[lane] = lane * 3u + 1u;
+    GroupMemoryBarrierWithGroupSync();
+    uint partner = s_data[63u - lane];
+    uint active = WaveActiveCountBits(true);
+    OutBuf.Store(lane * 4u, partner + (active << 16));
+}
+"#,
+            std::array::from_fn(|i| (63 - i as u32) * 3 + 1),
+        ),
+        (
+            "divergent_lane_private_lds",
+            r#"
+RWByteAddressBuffer OutBuf : register(u0);
+groupshared uint s_priv[128];
+
+[RootSignature("DescriptorTable(UAV(u0))")]
+[numthreads(128, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID)
+{
+    uint lane = gtid.x;
+    s_priv[lane] = lane + 10u;
+    GroupMemoryBarrierWithGroupSync();
+    [branch]
+    if (OutBuf.Load(0u) != 999u && (lane & 1u) == 0u) {
+        s_priv[lane] = s_priv[lane] * 2u + 5u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 64u) {
+        OutBuf.Store(lane * 4u, s_priv[lane]);
+    }
+}
+"#,
+            std::array::from_fn(|i| {
+                let lane = i as u32;
+                let base = lane + 10;
+                if (lane & 1) == 0 {
+                    base * 2 + 5
+                } else {
+                    base
+                }
+            }),
+        ),
+        (
+            "loop_lds_atomic_sum",
+            r#"
+RWByteAddressBuffer OutBuf : register(u0);
+groupshared uint s_sum;
+
+[RootSignature("DescriptorTable(UAV(u0))")]
+[numthreads(64, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID)
+{
+    uint lane = gtid.x;
+    if (lane == 0u) {
+        s_sum = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = 0u; k < 4u; ++k) {
+        InterlockedAdd(s_sum, lane + k);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    OutBuf.Store(lane * 4u, s_sum);
+}
+"#,
+            // sum_{lane=0..63} sum_{k=0..3} (lane + k) = 4*(63*64/2) + 64*(0+1+2+3) = 8064 + 384 = 8448
+            [8448u32; 64],
+        ),
+    ];
+
+    let tmp = std::env::temp_dir().join(format!(
+        "victory_xdxc_test_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).or_else(|_| Host::new(true)).ok();
+    let mut val = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+
+    for (name, hlsl, expected) in cases {
+        let src = tmp.join(format!("{name}.hlsl"));
+        std::fs::write(&src, hlsl).expect("write hlsl");
+        for (wave32, extra) in [(false, None), (true, Some("-D__XBOX_ENABLE_WAVE32=1"))] {
+            let tag = if wave32 { "w32" } else { "w64" };
+            let out_bin = tmp.join(format!("{name}_{tag}.dxbc"));
+            let mut cmd = Command::new(&xdxc);
+            cmd.args(["-T", "cs_6_6", "-E", "main"]);
+            if let Some(flag) = extra {
+                cmd.arg(flag);
+            }
+            let status = cmd
+                .arg(&src)
+                .arg("-Fo")
+                .arg(&out_bin)
+                .output()
+                .expect("run xdxc.exe");
+            assert!(
+                status.status.success(),
+                "xdxc.exe failed on {name}_{tag}: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let raw = std::fs::read(&out_bin).expect("read dxbc");
+            let parsed = crate::dxbc::Container::parse(&raw).expect("parse xdxc container");
+            let accc = parsed
+                .part(crate::dxbc::FourCC::ACCC)
+                .expect("xdxc.exe output should contain ACCC native Scarlett chunk");
+            let progs = crate::native::native_programs(accc.data).expect("native::native_programs");
+            assert_eq!(progs.len(), 1, "{name}_{tag}: expected 1 native program");
+            assert_eq!(
+                progs[0].wave64,
+                !wave32,
+                "{name}_{tag}: expected wave64={} from xdxc",
+                !wave32
+            );
+            // Translate purely from the native Scarlett ACCC chunk (matching Xbox
+            // stripped containers where only ACCC/FSSM/FSPX is present).
+            let container = crate::dxbc::build(&[(crate::dxbc::FourCC::ACCC, accc.data)]);
+
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let use_lds_analyze = name == "divergent_lane_private_lds";
+            let shader = super::lds::with_lds_analyze(use_lds_analyze, || {
+                super::translate(&container)
+            });
+            lower::TEST_HOST_WAVE.set(was);
+            let shader =
+                shader.unwrap_or_else(|e| panic!("translate({name}_{tag}) failed: {e}"));
+            if let Some(v) = val.as_mut() {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy)
+                    .unwrap_or_else(|e| panic!("dxil.dll validate({name}_{tag}) failed: {e}"));
+            }
+
+            if let Some(host) = &host {
+                let (root, pso) = host
+                    .compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("compute_pipeline({name}_{tag}) failed: {e}"));
+                let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                let mut roots = Vec::new();
+                if shader.user_data_dwords() > 0 {
+                    roots.push((0u32, Root::Constants(ud)));
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots,
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("dispatch({name}_{tag}) failed: {e}"));
+                let got = &out[0];
+                if name == "lds_cross_half_exchange" {
+                    let expected_wave = if wave32 { 32u32 } else { 64u32 };
+                    let want: Vec<u32> = expected
+                        .iter()
+                        .map(|&lo| lo | (expected_wave << 16))
+                        .collect();
+                    assert_eq!(got.as_slice(), want.as_slice(), "{name}_{tag} GPU output mismatch");
+                } else {
+                    assert_eq!(got.as_slice(), expected.as_slice(), "{name}_{tag} GPU output mismatch");
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

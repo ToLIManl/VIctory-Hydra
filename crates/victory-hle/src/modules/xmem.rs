@@ -102,7 +102,12 @@ pub extern "system" fn XMemVirtualAlloc(
         },
     };
     let asked = protect;
+    // Console-only `PAGE_GRAPHICS_*` bits (`0x800..=0x40000` in `xmem.h:26-33`):
+    // if a caller sets only graphics protection bits without a low Win32
+    // protection value, default to `PAGE_READWRITE` instead of `PAGE_NOACCESS`.
+    const GRAPHICS_PROTECTION: u32 = 0x7_F800;
     let mut protect = match protect & HOST_PROTECTION {
+        0 if asked & GRAPHICS_PROTECTION != 0 => PAGE_READWRITE,
         0 => PAGE_NOACCESS,
         p => p,
     };
@@ -370,6 +375,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -2046,12 +2052,30 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
+/// Full GDK `XMEM_WORKING_SET_STATISTICS` (`xmem.h:172-191`, 0x78 bytes on x64).
+/// Callers passing GDK flags (`which & 0x2000_0000 != 0`) supply this 0x78-byte
+/// struct; older Era callers supply the leading 0x50-byte [`WorkingSet`] prefix.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct WorkingSetV2 {
+    pub base: WorkingSet,
+    pub direct_storage_used: u32,
+    pub frame_preserve_buffer_size: u32,
+    pub game_used_peak: usize,
+    pub gpu_page_table_size: u32,
+    pub cpu_page_table_size: u32,
+    pub reserved1: [usize; 2],
+}
+const _: () = assert!(size_of::<WorkingSet>() == 0x50);
+const _: () = assert!(size_of::<WorkingSetV2>() == 0x78);
+
 /// The title's budget and our process's commit as what it uses. No tools
 /// memory: a retail console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
-pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+pub extern "system" fn XMemGetWorkingSetStatistics(which: u32, out: *mut WorkingSet) -> BOOL {
+    const GDK_WORKING_SET_FLAG: u32 = 0x2000_0000;
     if out.is_null() {
         return 0;
     }
@@ -2081,14 +2105,24 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     if asked.is_multiple_of(1024) {
         tracing::info!(
             asked = asked + 1,
-            which = _which,
+            which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
             "the title asks how much memory it uses"
         );
     }
-    // SAFETY: checked non-null; the title passes room for the structure.
-    unsafe { out.write(stats) };
+    if which & GDK_WORKING_SET_FLAG != 0 {
+        let full = WorkingSetV2 {
+            base: stats,
+            game_used_peak: counters.PeakPagefileUsage,
+            ..Default::default()
+        };
+        // SAFETY: GDK callers (`XMEM_WORKING_SET_*`) pass a 0x78-byte `XMEM_WORKING_SET_STATISTICS`.
+        unsafe { out.cast::<WorkingSetV2>().write(full) };
+    } else {
+        // SAFETY: checked non-null; legacy callers pass the 0x50-byte prefix.
+        unsafe { out.write(stats) };
+    }
     1
 }
 
@@ -2228,23 +2262,34 @@ mod tests {
 
     #[test]
     fn transfers_shrink_the_title_budget() {
-        let mut before = WorkingSet::default();
-        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
-        assert!(before.title_used > 0);
+        let mut before = WorkingSetV2::default();
+        assert_eq!(
+            XMemGetWorkingSetStatistics(0x2000_0001, (&raw mut before).cast()),
+            1
+        );
+        assert!(before.base.title_used > 0);
+        assert!(before.game_used_peak >= before.base.title_used);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
         let standard = victory_gpu::console::current().title_memory().1;
         assert_eq!(XMemTransferMemory(0, standard), 0, "over budget");
-        let mut after = WorkingSet::default();
-        XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
-        assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+        let mut after = WorkingSetV2::default();
+        XMemGetWorkingSetStatistics(0x2000_0001, (&raw mut after).cast());
+        assert_eq!(before.base.title_limit - after.base.title_limit, 128 * MIB);
+        // Legacy 0x50-byte caller (without GDK 0x2000_0000 flag) only writes 0x50 bytes.
+        let mut legacy = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(1, &mut legacy), 1);
+        assert_eq!(legacy.title_limit, after.base.title_limit);
     }
 
     #[test]
     fn statistics_have_the_console_layout() {
         assert_eq!(size_of::<WorkingSet>(), 0x50);
+        assert_eq!(size_of::<WorkingSetV2>(), 0x78);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+        assert_eq!(std::mem::offset_of!(WorkingSetV2, direct_storage_used), 0x50);
+        assert_eq!(std::mem::offset_of!(WorkingSetV2, game_used_peak), 0x58);
     }
 
     #[test]

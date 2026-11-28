@@ -52,8 +52,12 @@ mod drvwatch;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod gpu_prof;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(windows)]
+mod vrs;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

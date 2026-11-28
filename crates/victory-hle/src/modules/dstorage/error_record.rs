@@ -58,6 +58,13 @@ impl Record {
         self.destination_size = r.destination_size;
         self.source_size = r.source_size;
         self.tag = r.tag;
+        if !r.name.is_null() {
+            // SAFETY: caller-provided NUL-terminated request name string.
+            let name = unsafe { std::ffi::CStr::from_ptr(r.name) }.to_bytes();
+            let n = name.len().min(self.name.len() - 1);
+            self.name[..n].copy_from_slice(&name[..n]);
+            self.name[n] = 0;
+        }
         if r.options & MEMORY_SOURCE != 0 {
             self.memory_source = r.source as u64;
         } else {

@@ -2922,7 +2922,14 @@ unsafe fn record_card_batch(
                 ptr: batch.gpu_start + u64::from(uav_base) * u64::from(batch.step),
             },
         );
+        let prof_kind = if items.iter().any(|i| i.mode != 0) {
+            crate::gpu_prof::PassKind::Compare
+        } else {
+            crate::gpu_prof::PassKind::Hash
+        };
+        let gpu_tok = crate::gpu_prof::begin(list, prof_kind, 0, false);
         list.Dispatch(total_pieces, 1, 1);
+        crate::gpu_prof::end(list, gpu_tok);
     }
     batch.desc_cursor += needed_descs;
     batch.job_cursor += needed_jobs;
@@ -11858,6 +11865,7 @@ impl Host {
             p.panel.frame(p.meter.line_due());
             p.menu.frame();
             crate::prof::on_present();
+            crate::gpu_prof::on_present(self, frame, crate::draw::frame_draws_snapshot());
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -11865,6 +11873,59 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Submits an asynchronous `ResolveQueryData` command for `crate::gpu_prof`
+    /// on the host queue without blocking; returns the signaled fence value.
+    pub(crate) fn submit_gpu_prof_resolve(
+        &self,
+        allocator: &ID3D12CommandAllocator,
+        list: &ID3D12GraphicsCommandList,
+        heap: &ID3D12QueryHeap,
+        back: &ID3D12Resource,
+        count: u32,
+    ) -> Option<u64> {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: dedicated allocator/list only reused after previous resolve fence completed.
+        let ok = unsafe {
+            (|| -> windows::core::Result<u64> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count, back, 0);
+                list.Close()?;
+                let cmd: ID3D12CommandList = list.cast()?;
+                self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                *submitted += 1;
+                self.queue.Signal(&self.fence, *submitted)?;
+                Ok(*submitted)
+            })()
+        };
+        ok.ok()
+    }
+
+    /// Whether the host D3D12 runtime + driver support Enhanced Barriers (`D3D12_OPTIONS12`).
+    pub(crate) fn enhanced_barriers_supported(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            // SAFETY: feature query of matching size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut o).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+                )
+            };
+            let supported = ok.is_ok() && o.EnhancedBarriersSupported.as_bool();
+            tracing::info!(supported, "host Enhanced Barriers support (D3D12_OPTIONS12)");
+            supported
+        })
+    }
+
+    /// Current GPU-completed value of the host queue's fence (non-blocking).
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: plain fence value query.
+        unsafe { self.fence.GetCompletedValue() }
     }
 
     /// Lets the swap chain and what presents with it go, once everything

@@ -266,8 +266,9 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Recordings begun, for [`Front::bound`] (`VICTORY_THIN_BAKE>=2`).
 static LIVE: Mutex<Vec<std::sync::Weak<Recording>>> = Mutex::new(Vec::new());
-/// Lists of ours nobody uses, closed (capped to bound peak allocator retention).
-const BACKS_MAX: usize = 64;
+/// Lists of ours nobody uses, closed (backing wrappers hold `host: None` once
+/// detached, so caching up to 256 keeps zero D3D12 allocators pinned).
+const BACKS_MAX: usize = 256;
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated,
@@ -436,9 +437,18 @@ impl Drop for Recording {
                 backs.push(inner.back);
             } else {
                 drop(backs);
-                // SAFETY: `inner.back` was allocated via `Box::into_raw(super::boxed(...))`,
+                // SAFETY: `inner.back` was allocated via `Box::into_raw(super::boxed_empty(...))`,
                 // is closed, and is owned exclusively by this dropped `Recording`.
-                unsafe { drop(Box::from_raw(inner.back as *mut List)) };
+                // Any unsubmitted host list still attached (e.g. an abandoned recording)
+                // is recycled back to `IDLE` instead of destroying its D3D12 allocators.
+                let mut boxed = unsafe { Box::from_raw(inner.back as *mut List) };
+                for part in boxed.earlier.drain(..) {
+                    super::recycle_unused(part.host);
+                }
+                if let Some(host) = boxed.host.take() {
+                    super::recycle_unused(host);
+                }
+                drop(boxed);
             }
         }
     }
@@ -460,7 +470,8 @@ fn back_list(_kind: u32) -> This {
     std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast()
 }
 
-/// A list of ours, closed.
+/// A list of ours, ready for the recording's initial `RESET` (which acquires
+/// an already-reset pooled host list lazily).
 #[cfg(not(test))]
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
@@ -468,9 +479,7 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
-    list
+    Box::into_raw(super::boxed_empty(kind)).cast_const().cast()
 }
 
 fn start() {
@@ -662,6 +671,7 @@ const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 /// Work of ours (`super::external`), boxed.
 const EXTERNAL: u64 = after(17);
+const SHADING_RATE: u64 = after(18);
 
 /// Writes down work of ours at this place of a title list's stream
 /// ([`super::external`]); gives it back if the list is not written down.
@@ -760,8 +770,28 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if count == 0 {
+        return;
+    }
+    let action = super::classify_barrier_groups(count, groups);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    super::note_enhanced_stats(action.stats, action.is_noop());
+    if action.is_noop() {
+        return;
+    }
+    let mut words = [0u64; 17];
+    let len = if action.global_uav {
+        words[0] = 1;
+        1
+    } else {
+        words[0] = (action.scoped_len as u64) << 1;
+        for (i, &r) in action.scoped_textures[..action.scoped_len].iter().enumerate() {
+            words[1 + i] = r as u64;
+        }
+        1 + action.scoped_len
+    };
+    front(this).put(BARRIER_GROUPS, &words[..len]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -857,6 +887,16 @@ extern "system" fn clear_dsv(
         &[u64::from(count), u64::from(flags) | u64::from(stencil) << 32, Word::word(depth)],
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
+}
+extern "system" fn shading_rate(this: This, base_rate: u32, combiners: *const u32) {
+    let (has_comb, c0, c1) = if combiners.is_null() {
+        (0u64, 0u64, 0u64)
+    } else {
+        // SAFETY: D3D12 specifies 2 combiner dwords when non-null.
+        let (a, b) = unsafe { (*combiners, *combiners.add(1)) };
+        (1, u64::from(a), u64::from(b))
+    };
+    front(this).put(SHADING_RATE, &[u64::from(base_rate), has_comb, c0, c1]);
 }
 extern "system" fn copy_texture_region(
     this: This,
@@ -1145,7 +1185,19 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+            BARRIER_GROUPS => {
+                let mut action = super::EnhancedAction::empty();
+                if n & 1 != 0 {
+                    action.global_uav = true;
+                } else {
+                    let scoped = ((n >> 1) & 0x1f).min(16).min(w.len().saturating_sub(1));
+                    action.scoped_len = scoped;
+                    for (i, &ptr) in w[1..1 + scoped].iter().enumerate() {
+                        action.scoped_textures[i] = ptr as This;
+                    }
+                }
+                super::apply_enhanced_action(list, &action);
+            }
             CLEAR_RTV => {
                 super::clear_rtv(
                     list,
@@ -1179,6 +1231,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 2 + 2 * step, boxed),
                 );
             }
+            SHADING_RATE if w.len() >= 4 => {
+                let comb = [w[2] as u32, w[3] as u32];
+                let ptr = if w[1] != 0 { comb.as_ptr() } else { std::ptr::null() };
+                super::set_shading_rate(list, w[0] as u32, ptr);
+            }
             _ => {}
         }
     }
@@ -1203,7 +1260,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 51] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -1247,6 +1304,7 @@ const MINE: [(usize, *const ()); 50] = [
     (71, wait_value as *const ()),
     (72, wait_value64 as *const ()),
     (78, dispatch_x as *const ()),
+    (124, shading_rate as *const ()),
     (83, copy_texture_region_x as *const ()),
     (84, copy_resource_x as *const ()),
     (98, dispatch_mesh_x as *const ()),
@@ -1341,7 +1399,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");

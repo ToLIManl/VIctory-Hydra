@@ -144,7 +144,9 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
     let swizzle = match desc.layout {
         0 => suggested(desc),
         ROW_MAJOR => Swizzle::LINEAR,
-        l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
+        // `XG_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE` (2) and `64KB_STANDARD_SWIZZLE` (3).
+        2 | 3 => Swizzle::SW_64KB_S,
+        l if (SWIZZLED..=SWIZZLED | 0x1f).contains(&l) => Swizzle(l & 0x1f),
         _ => return None,
     };
     let texture = Texture::new(&TextureDesc {
@@ -261,10 +263,10 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.in_tail = 1;
             out.alignment = 256;
             out.swizzle = tail_swizzle(l.desc.swizzle);
+            out.tail_position = t.x | t.y << 11;
             if l.thick {
                 // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
-                out.tail_position = t.x | t.y << 11;
             } else {
                 out.offset = u64::from(t.offset);
                 out.slice_size = slice;
@@ -512,25 +514,27 @@ extern "system" fn tiling(
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
             let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+            if !out.is_null() {
+                for i in 0..wanted {
+                    let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                    let m = &l.mips[mip as usize];
+                    let entry = if tail && slice > 0 {
+                        SubresourceTiling {
+                            width: 0,
+                            height: 0,
+                            depth: 0,
+                            start: 0,
+                        }
+                    } else {
+                        SubresourceTiling {
+                            width: m.pitch / l.block[0],
+                            height: (m.rows / l.block[1]) as u16,
+                            depth: 1,
+                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                        }
+                    };
+                    out.add(i as usize).write(entry);
+                }
             }
             *n = wanted;
         }
@@ -569,32 +573,64 @@ extern "system" fn element_offset(
     }
 }
 
-/// Slots the title does not call: size, alignment, offsets, coordinates,
-/// view descriptor, tiled-resource query.
+/// Slot 0x18: `GetResourceSizeBytes()`.
+extern "system" fn resource_size_bytes(this: This) -> u64 {
+    computer(this).texture.size
+}
+
+/// Slot 0x20: `GetResourceBaseAlignmentBytes()`.
+extern "system" fn resource_base_alignment(this: This) -> u64 {
+    computer(this).texture.alignment
+}
+
+/// Slot 0x28: `GetMipLevelOffsetBytes(Plane, MipLevel)`.
+extern "system" fn mip_level_offset(this: This, plane: u32, mip: u32) -> u64 {
+    let Some(p) = computer(this).texture.planes.get(plane as usize) else {
+        return 0;
+    };
+    let Some(m) = p.layout.mips.get(mip as usize) else {
+        return 0;
+    };
+    let mip_off = match m.tail {
+        Some(t) if !p.layout.thick => u64::from(t.offset),
+        _ => m.offset,
+    };
+    p.offset + mip_off
+}
+
+/// Slot 0x60: `IsTiledResource()` (`xg_xs.h:840`, returns `bool`).
+extern "system" fn is_tiled_resource(this: This) -> bool {
+    const LAYOUT_64KB_UNDEFINED_SWIZZLE: u32 = 2;
+    computer(this).desc.layout == LAYOUT_64KB_UNDEFINED_SWIZZLE
+}
+
+/// Slots the title does not call: coordinates, view descriptor, swizzle info.
 extern "system" fn unused(this: This) -> HRESULT {
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }
 
+/// 14 virtual methods per `XGTextureAddressComputer` (`xg_xs.h:727-848`).
 #[repr(C)]
-struct Vtable([*const (); 13]);
+struct Vtable([*const (); 14]);
 // SAFETY: function addresses only.
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-    add_ref as *const (),   // 0x00
-    release as *const (),   // 0x08
-    layout as *const (),    // 0x10
-    unused as *const (),    // 0x18 size
-    unused as *const (),    // 0x20 alignment
-    unused as *const (),    // 0x28 mip offset
-    element_offset as *const (), // 0x30
-    unused as *const (),    // 0x38 element coordinate
-    copy_into as *const (), // 0x40
-    copy_from as *const (), // 0x48
-    tiling as *const (),    // 0x50
-    unused as *const (),    // 0x58 view descriptor
-    unused as *const (),    // 0x60 tiled resource?
+    add_ref as *const (),                 // 0x00 AddRef
+    release as *const (),                 // 0x08 Release
+    layout as *const (),                  // 0x10 GetResourceLayout
+    resource_size_bytes as *const (),     // 0x18 GetResourceSizeBytes
+    resource_base_alignment as *const (), // 0x20 GetResourceBaseAlignmentBytes
+    mip_level_offset as *const (),        // 0x28 GetMipLevelOffsetBytes
+    element_offset as *const (),          // 0x30 GetTexelElementOffsetBytes
+    unused as *const (),                  // 0x38 GetTexelCoordinate
+    copy_into as *const (),               // 0x40 CopyIntoSubresource
+    copy_from as *const (),               // 0x48 CopyFromSubresource
+    tiling as *const (),                  // 0x50 GetResourceTiling
+    unused as *const (),                  // 0x58 GetTextureViewDescriptor
+    is_tiled_resource as *const (),       // 0x60 IsTiledResource
+    unused as *const (),                  // 0x68 GetSwizzlePatternInfo
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -780,5 +816,242 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn vtable_size_alignment_mip_offset_and_is_tiled_match_layout() {
+        let c = create(&desc(256, 256, 4, 28, 0x109)); // SW_64KB_S
+        let mut l = std::mem::MaybeUninit::<LayoutOut>::zeroed();
+        assert_eq!(layout(c, l.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by `layout`.
+        let l = unsafe { l.assume_init() };
+        assert_eq!(resource_size_bytes(c), l.size);
+        assert_eq!(resource_base_alignment(c), l.alignment);
+        for mip in 0..4u32 {
+            assert_eq!(mip_level_offset(c, 0, mip), l.plane[0].mips[mip as usize].offset);
+        }
+        assert!(!is_tiled_resource(c));
+        // Null `out` pointer in `tiling` must safely return count without crashing.
+        let mut count = 4u32;
+        assert_eq!(
+            tiling(
+                c,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!(release(c), 0);
+
+        // Layout 2 (`XG_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE`) is tiled.
+        let tiled = create(&desc(256, 256, 4, 28, 2));
+        assert!(is_tiled_resource(tiled));
+        assert_eq!(release(tiled), 0);
+    }
+
+    /// Cross-validates `xg.rs` + `victory-formats::texture` byte-for-byte against
+    /// a PC `xg_xs.dll` supplied via `VICTORY_GDKX_TOOLS_DIR` (skips when unset).
+    #[cfg(windows)]
+    #[test]
+    fn matches_pc_xg_xs_dll_layout_and_tiling_if_present() {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        let Some(dir) = std::env::var_os("VICTORY_GDKX_TOOLS_DIR") else {
+            return;
+        };
+        let dll = std::path::PathBuf::from(dir).join("xg_xs.dll");
+        if !dll.is_file() {
+            return;
+        }
+        let wide: Vec<u16> = dll.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: loading an explicit PC reference DLL path from env var.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        assert!(!module.is_null(), "failed to load {}", dll.display());
+
+        type CreateFn = extern "system" fn(*const ResourceDesc, *mut *mut c_void) -> HRESULT;
+        type SetHwFn = extern "system" fn(u32) -> HRESULT;
+        // SAFETY: standard exported C symbols in `xg_xs.dll`.
+        let create_sdk: CreateFn = unsafe {
+            let p = GetProcAddress(module, c"XGCreateTextureComputer".as_ptr().cast())
+                .expect("XGCreateTextureComputer export");
+            std::mem::transmute(p)
+        };
+        let set_hw: Option<SetHwFn> = unsafe {
+            GetProcAddress(module, c"XGSetHardwareVersion".as_ptr().cast())
+                .map(|p| std::mem::transmute(p))
+        };
+        if let Some(f) = set_hw {
+            let _ = f(5); // XG_HARDWARE_VERSION_SCARLETT_ANACONDA
+        }
+
+        // Deny compression/HTILE metadata planes so plane 0 data matches 1:1.
+        const DENY_META: u32 = 0x30_0000 | 0x8000_0000;
+        let cases: &[(u64, u32, u16, u16, u32, u32)] = &[
+            // (w, h, slices, mips, format, layout)
+            (13, 17, 1, 5, 28, 0x105),     // R8G8B8A8 odd SW_4KB_S
+            (37, 53, 3, 6, 28, 0x109),     // R8G8B8A8 array SW_64KB_S
+            (127, 65, 1, 7, 10, 0x10a),    // R16G16B16A16_FLOAT SW_64KB_D
+            (256, 256, 1, 9, 71, 0x105),   // BC1_UNORM SW_4KB_S with mip tail
+            (513, 257, 2, 10, 77, 0x109),  // BC3_UNORM odd array SW_64KB_S
+            (132, 68, 3, 6, 98, 0x109),    // BC7_UNORM odd array SW_64KB_S
+            (256, 128, 1, 8, 98, 0x106),   // BC7_UNORM SW_4KB_D
+            (64, 64, 1, 7, 98, 0x101),     // BC7_UNORM SW_256B_S
+            (64, 64, 1, 7, 28, 0x102),     // R8G8B8A8 SW_256B_D
+            (128, 128, 1, 1, 40, 0x109),   // D32_FLOAT SW_64KB_S
+            (128, 128, 1, 1, 20, 0x109),   // D32_FLOAT_S8X24_UINT SW_64KB_S
+            (128, 128, 1, 1, 45, 0x109),   // D24_UNORM_S8_UINT SW_64KB_S
+        ];
+
+        for &(w, h, slices, mips, format, layout_val) in cases {
+            let mut d = desc(w, h, mips, format, layout_val);
+            d.depth_or_array = slices;
+            d.flags = DENY_META;
+
+            let mut sdk_c = std::ptr::null_mut();
+            let hr = create_sdk(&d, &mut sdk_c);
+            assert_eq!(hr, S_OK, "SDK failed on {d:?}");
+
+            // Our HLE computer ignores meta deny flags; clear flags for ours.
+            let mut our_d = d;
+            our_d.flags = 0;
+            let our_c = create(&our_d);
+
+            // SAFETY: 14-slot XGTextureAddressComputer vtable (`xg_xs.h:727-848`).
+            let vt = unsafe { *sdk_c.cast::<*const *const c_void>() };
+            type LayoutFn = extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT;
+            type ReleaseFn = extern "system" fn(*mut c_void) -> u32;
+            type CopyIntoFn = extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+            type CopyFromFn = extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+            let sdk_layout: LayoutFn = unsafe { std::mem::transmute(*vt.add(2)) };
+            let sdk_release: ReleaseFn = unsafe { std::mem::transmute(*vt.add(1)) };
+            let sdk_copy_into: CopyIntoFn = unsafe { std::mem::transmute(*vt.add(8)) };
+            let sdk_copy_from: CopyFromFn = unsafe { std::mem::transmute(*vt.add(9)) };
+
+            let mut l_sdk = std::mem::MaybeUninit::<LayoutOut>::zeroed();
+            let mut l_our = std::mem::MaybeUninit::<LayoutOut>::zeroed();
+            assert_eq!(sdk_layout(sdk_c, l_sdk.as_mut_ptr()), S_OK);
+            assert_eq!(layout(our_c, l_our.as_mut_ptr()), S_OK);
+            // SAFETY: initialized by `GetResourceLayout`.
+            let (l_sdk, l_our) = unsafe { (l_sdk.assume_init(), l_our.assume_init()) };
+
+            assert_eq!(l_our.size, l_sdk.size, "size mismatch for {d:?}");
+            assert_eq!(l_our.alignment, l_sdk.alignment, "alignment mismatch for {d:?}");
+            assert_eq!(l_our.mips, l_sdk.mips, "mips mismatch for {d:?}");
+            assert_eq!(l_our.planes, l_sdk.planes, "planes mismatch for {d:?}");
+            for p in 0..l_sdk.planes as usize {
+                let ps = &l_sdk.plane[p];
+                let po = &l_our.plane[p];
+                assert_eq!(po.offset, ps.offset, "plane {p} offset for {d:?}");
+                assert_eq!(po.size, ps.size, "plane {p} size for {d:?}");
+                assert_eq!(po.slice_size, ps.slice_size, "plane {p} slice_size for {d:?}");
+                assert_eq!(po.element_bytes, ps.element_bytes, "plane {p} bpe for {d:?}");
+                for m in 0..l_sdk.mips as usize {
+                    let ms = &ps.mips[m];
+                    let mo = &po.mips[m];
+                    assert_eq!(mo.offset, ms.offset, "p{p} m{m} offset for {d:?}");
+                    assert_eq!(mo.size, ms.size, "p{p} m{m} size for {d:?}");
+                    assert_eq!(mo.pitch_bytes, ms.pitch_bytes, "p{p} m{m} pitch for {d:?}");
+                    assert_eq!(mo.in_tail, ms.in_tail, "p{p} m{m} in_tail for {d:?}");
+                    assert_eq!(mo.tail_position, ms.tail_position, "p{p} m{m} tail_pos for {d:?}");
+                }
+            }
+
+            // Byte-for-byte CopyIntoSubresource / CopyFromSubresource comparison
+            // across every mip and slice for single-plane color/BC formats.
+            if l_sdk.planes == 1 {
+                let mut tiled_sdk = vec![0u8; l_sdk.size as usize];
+                let mut tiled_our = vec![0u8; l_our.size as usize];
+                let bpe = l_sdk.plane[0].element_bytes as usize;
+                for slice in 0..u32::from(slices) {
+                    for mip in 0..l_sdk.mips {
+                        let sub = slice * l_sdk.mips + mip;
+                        let m = &l_sdk.plane[0].mips[mip as usize];
+                        let row_bytes = m.elements[0] as usize * bpe;
+                        let row_pitch = row_bytes + 16;
+                        let slice_bytes = row_pitch * m.elements[1] as usize;
+                        let src: Vec<u8> = (0..slice_bytes)
+                            .map(|i| ((i * 29 + sub as usize * 17 + 5) & 0xff) as u8)
+                            .collect();
+                        assert_eq!(
+                            sdk_copy_into(
+                                sdk_c,
+                                tiled_sdk.as_mut_ptr(),
+                                0,
+                                sub,
+                                src.as_ptr(),
+                                row_pitch as u32,
+                                slice_bytes as u32
+                            ),
+                            S_OK,
+                            "sdk copy_into sub={sub} {d:?}"
+                        );
+                        assert_eq!(
+                            copy_into(
+                                our_c,
+                                tiled_our.as_mut_ptr(),
+                                0,
+                                sub,
+                                src.as_ptr(),
+                                row_pitch as u32,
+                                slice_bytes as u32
+                            ),
+                            S_OK,
+                            "our copy_into sub={sub} {d:?}"
+                        );
+                        // Detile SDK's tiled buffer using our `copy_from` and confirm exact match.
+                        let mut detiled_our = vec![0xeeu8; slice_bytes];
+                        let mut detiled_sdk = vec![0xeeu8; slice_bytes];
+                        assert_eq!(
+                            copy_from(
+                                our_c,
+                                detiled_our.as_mut_ptr(),
+                                0,
+                                sub,
+                                0,
+                                tiled_sdk.as_ptr(),
+                                row_pitch as u32,
+                                slice_bytes as u32
+                            ),
+                            S_OK
+                        );
+                        assert_eq!(
+                            sdk_copy_from(
+                                sdk_c,
+                                detiled_sdk.as_mut_ptr(),
+                                0,
+                                sub,
+                                0,
+                                tiled_sdk.as_ptr(),
+                                row_pitch as u32,
+                                slice_bytes as u32
+                            ),
+                            S_OK
+                        );
+                        for y in 0..m.elements[1] as usize {
+                            let off = y * row_pitch;
+                            assert_eq!(
+                                &detiled_our[off..off + row_bytes],
+                                &detiled_sdk[off..off + row_bytes],
+                                "detile mismatch sub={sub} y={y} {d:?}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(tiled_our, tiled_sdk, "tiled bytes mismatch for {d:?}");
+            }
+
+            let _ = sdk_release(sdk_c);
+            assert_eq!(release(our_c), 0);
+        }
+
+        // SAFETY: freeing the DLL loaded above.
+        unsafe { FreeLibrary(module) };
     }
 }

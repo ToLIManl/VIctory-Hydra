@@ -68,6 +68,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Whether the console RDNA2 shader container declares Wave64 execution.
+    #[cfg(windows)]
+    pub(crate) native_wave64: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -161,6 +164,24 @@ fn hair_strands(container: &[u8]) -> bool {
         })
 }
 
+#[cfg(windows)]
+fn container_wave64(bytes: &[u8]) -> bool {
+    let Ok(c) = victory_shader::Container::parse(bytes) else {
+        return false;
+    };
+    if let Some(part) = c.part(victory_shader::FourCC(*b"ACCC")) {
+        return victory_shader::native::fspx_program(part.data)
+            .ok()
+            .is_some_and(|p| p.wave64);
+    }
+    if let Some(part) = c.part(victory_shader::FourCC(*b"DXIL")) {
+        return victory_shader::native_programs(part.data)
+            .ok()
+            .is_some_and(|progs| progs.iter().any(|p| p.wave64));
+    }
+    false
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -179,6 +200,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hair: hair_strands(bytes) || idle_without_rays(bytes),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                native_wave64: container_wave64(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -880,6 +903,154 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// `D3D12XBOX_DESERIALIZE_SHADER` (`d3d12_xs.h:14106`, 0x20 bytes on x64).
+#[repr(C)]
+pub(crate) struct DeserializeShader {
+    pub(crate) instructions: *const u8,
+    pub(crate) instructions_size: usize,
+    pub(crate) metadata: *const u8,
+    pub(crate) metadata_size: usize,
+}
+const _: () = assert!(size_of::<DeserializeShader>() == 0x20);
+
+/// `D3D12XBOX_DESERIALIZE_GRAPHICS_PIPELINE_STATE` (`d3d12_xs.h:14114`, 0x108 bytes on x64).
+#[repr(C)]
+pub(crate) struct DeserializeGraphicsDesc {
+    pub(crate) root_signature: This,
+    pub(crate) packet: *const u8,
+    pub(crate) packet_size: usize,
+    pub(crate) metadata: *const u8,
+    pub(crate) metadata_size: usize,
+    pub(crate) ps: DeserializeShader,
+    pub(crate) vs: DeserializeShader,
+    pub(crate) gs: DeserializeShader,
+    pub(crate) es: DeserializeShader,
+    pub(crate) hs: DeserializeShader,
+    pub(crate) ls: DeserializeShader,
+    pub(crate) fs: DeserializeShader,
+}
+const _: () = assert!(size_of::<DeserializeGraphicsDesc>() == 0x108);
+
+/// Device method 0x1c8 (slot 57): `DeserializeGraphicsPipelineStateX`.
+///
+/// Validates the `0x108`-byte `D3D12XBOX_DESERIALIZE_GRAPHICS_PIPELINE_STATE`
+/// descriptor (`d3d12_xs.h:14114`), logs the first observed stage/packet shapes
+/// when `VICTORY_DESERIALIZE_PSO=1`, and returns `E_NOTIMPL` unless full
+/// graphics state reconstruction is available (so titles safely fall back to
+/// `CreatePipelineState` / `CreateGraphicsPipelineState` with intact blend/depth/RT state).
+pub(crate) extern "system" fn deserialize_graphics(
+    _: This,
+    desc: *const DeserializeGraphicsDesc,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: caller's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    // SAFETY: title passes a descriptor pointer (null tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if desc.packet.is_null() || desc.packet_size == 0 {
+        return E_INVALIDARG;
+    }
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(
+            packet_size = desc.packet_size,
+            meta_size = desc.metadata_size,
+            ps_isa = desc.ps.instructions_size,
+            vs_isa = desc.vs.instructions_size,
+            gs_isa = desc.gs.instructions_size,
+            es_isa = desc.es.instructions_size,
+            hs_isa = desc.hs.instructions_size,
+            ls_isa = desc.ls.instructions_size,
+            fs_isa = desc.fs.instructions_size,
+            "DeserializeGraphicsPipelineStateX: observed Scarlett graphics blob (falling back to CreatePipelineState for full host state)"
+        );
+    }
+    crate::object::E_NOTIMPL
+}
+
+/// `D3D12XBOX_DESERIALIZE_COMPUTE_PIPELINE_STATE` (`d3d12_xs.h:14137`, 0x48 bytes on x64).
+#[repr(C)]
+pub(crate) struct DeserializeComputeDesc {
+    pub(crate) root_signature: This,
+    pub(crate) packet: *const u8,
+    pub(crate) packet_size: usize,
+    pub(crate) metadata: *const u8,
+    pub(crate) metadata_size: usize,
+    pub(crate) cs: DeserializeShader,
+}
+const _: () = assert!(size_of::<DeserializeComputeDesc>() == 0x48);
+
+/// Whether `DeserializeComputePipelineStateX` (device slot 67 / `0x218`)
+/// deserializes offline `FSPX`-format compute PSOs (`VICTORY_DESERIALIZE_PSO=1`).
+///
+/// Default off: titles that ship a pre-serialized cache alongside standard
+/// `CreateComputePipelineStateX` (`0x1f0`) fall back to `0x1f0` on `E_NOTIMPL`,
+/// preserving full DXBC containers (shader names, hashes, and shader cache keys).
+pub(crate) fn deserialize_pso_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESERIALIZE_PSO").is_some_and(|v| v == "1"))
+}
+
+/// Device method 0x218 (slot 67): `DeserializeComputePipelineStateX`.
+///
+/// Repacks the four separated compute PSO blobs (`pPacket`, `pMetaData`,
+/// `CS.pGpuInstructions`, `CS.pMetaData`) into an `ACCC` (`FSPX`) DXBC container
+/// and hands out a normal [`Pipeline`] when `VICTORY_DESERIALIZE_PSO=1`.
+pub(crate) extern "system" fn deserialize_compute(
+    _: This,
+    desc: *const DeserializeComputeDesc,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the caller's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    // SAFETY: the title passes its description (null tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if desc.packet.is_null()
+        || desc.packet_size == 0
+        || desc.cs.instructions.is_null()
+        || desc.cs.instructions_size == 0
+        || desc.cs.metadata.is_null()
+        || desc.cs.metadata_size == 0
+    {
+        return E_INVALIDARG;
+    }
+    // SAFETY: lengths checked non-zero and pointers non-null per D3D12.XS contract.
+    let (packet, pso_meta, cs_isa, cs_meta) = unsafe {
+        let packet = std::slice::from_raw_parts(desc.packet, desc.packet_size);
+        let pso_meta = if desc.metadata.is_null() || desc.metadata_size == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(desc.metadata, desc.metadata_size)
+        };
+        let cs_isa = std::slice::from_raw_parts(desc.cs.instructions, desc.cs.instructions_size);
+        let cs_meta = std::slice::from_raw_parts(desc.cs.metadata, desc.cs.metadata_size);
+        (packet, pso_meta, cs_isa, cs_meta)
+    };
+    match victory_shader::native::pack_fspx_compute(packet, pso_meta, cs_isa, cs_meta) {
+        Ok(container) => hand_out(
+            vec![shader("compute", &container)],
+            #[cfg(windows)]
+            None,
+            iid,
+            out,
+        ),
+        Err(e) => {
+            tracing::debug!(error = %e, packet_size = desc.packet_size, cs_meta_size = desc.cs.metadata_size, "DeserializeComputePipelineStateX: unsupported payload layout");
+            crate::object::E_NOTIMPL
+        }
+    }
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -890,7 +1061,7 @@ pub(crate) struct StreamDesc {
 
 /// A subobject type's size (type included), and the stage it is if it is a
 /// shader. The console numbers amplification and mesh shaders 23 and 24
-/// (PC: 24 and 25); its own types from 25 on are not sized yet.
+/// (PC: 24 and 25); Xbox-specific subobjects 25..=29 match `d3d12_xs.h:14226`.
 fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
     let stage = |name| Some((24, Some(name)));
     match kind {
@@ -912,6 +1083,15 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
         21 => Some((64, None)),
         22 => Some((32, None)),
         9 | 13 | 14 | 16 | 18 | 20 => Some((8, None)),
+        // Xbox-specific subobjects (d3d12_xs.h:14226-14230, verified via MSVC x64):
+        // 25 PIXEL_SHADER_OPTIONS (32B), 26 DEPTH_STENCIL_OPTIONS (24B),
+        // 27 GRAPHICS_SHADER_LIMITS (60B), 28 TESSELLATION_PARAMETERS (12B),
+        // 29 COMPUTE_SHADER_LIMITS (24B).
+        25 => Some((40, None)),
+        26 => Some((32, None)),
+        27 => Some((64, None)),
+        28 => Some((16, None)),
+        29 => Some((32, None)),
         _ => None,
     }
 }
@@ -1184,5 +1364,54 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn xbox_subobjects_25_to_29_advance_stream_and_deserialize_compute_creates_pipeline() {
+        // Verify Xbox-specific subobjects 25..=29 are sized accurately per d3d12_xs.h.
+        assert_eq!(subobject(25), Some((40, None)));
+        assert_eq!(subobject(26), Some((32, None)));
+        assert_eq!(subobject(27), Some((64, None)));
+        assert_eq!(subobject(28), Some((16, None)));
+        assert_eq!(subobject(29), Some((32, None)));
+
+        // Build a minimal valid FSPX compute PSO and deserialize it via 0x218 helper.
+        let mut packet = [0u8; 0x1c];
+        packet[0x0c..0x0e].copy_from_slice(&64u16.to_le_bytes());
+        packet[0x0e..0x10].copy_from_slice(&1u16.to_le_bytes());
+        packet[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        packet[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        let cs_isa = 0xBF81_0000u32.to_le_bytes(); // s_endpgm
+        let mut cs_meta = [0u8; 0x18];
+        cs_meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        cs_meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let pso_meta = [0x11u8; 0x14];
+
+        let desc = DeserializeComputeDesc {
+            root_signature: std::ptr::null(),
+            packet: packet.as_ptr(),
+            packet_size: packet.len(),
+            metadata: pso_meta.as_ptr(),
+            metadata_size: pso_meta.len(),
+            cs: DeserializeShader {
+                instructions: cs_isa.as_ptr(),
+                instructions_size: cs_isa.len(),
+                metadata: cs_meta.as_ptr(),
+                metadata_size: cs_meta.len(),
+            },
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert!(!p.is_null());
+        let list = shaders(p);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "compute");
+        let parsed = victory_shader::Container::parse(&list[0].1).unwrap();
+        let accc = parsed.part(victory_shader::FourCC::ACCC).unwrap();
+        assert_eq!(victory_shader::native_programs(accc.data).unwrap().len(), 1);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 }

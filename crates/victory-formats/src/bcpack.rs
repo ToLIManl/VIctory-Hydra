@@ -129,8 +129,8 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 16 + 16 i16).
+    /// Little-endian, no padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -222,10 +222,7 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                for v in ix.ix.as_flattened_mut() {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -1693,21 +1690,173 @@ mod tests {
             let want = std::fs::read(path.with_extension("out")).unwrap();
             let mut got = vec![0u8; want.len()];
             decode(bc, &std::fs::read(&path).unwrap(), &mut got, &t).unwrap();
-            assert!(got == want, "{}", path.display());
+            if got != want {
+                let bsz = if matches!(bc, 1 | 4) { 8 } else { 16 };
+                let diff_at = got.iter().zip(&want).position(|(a, b)| a != b).unwrap();
+                let blk = diff_at / bsz;
+                panic!(
+                    "{}: first diff at byte {diff_at} (block {blk})\n  want: {:02x?}\n   got: {:02x?}",
+                    path.display(),
+                    &want[blk * bsz..(blk + 1) * bsz],
+                    &got[blk * bsz..(blk + 1) * bsz]
+                );
+            }
             n += 1;
         }
         assert!(n > 0);
     }
 
-    /// A dictionary entry stands in for a block the decoder made: a set with
-    /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
+    /// A dictionary entry stands in for a block the decoder made: pixel 0 is
+    /// the anchor (top bit clear) and set 1 has 0 index bits in all entries.
     #[test]
     fn bc7_dictionary_indices_line_up() {
         let t = Tables::builtin().unwrap();
         for (k, (_, ix)) in t.bc7.iter().enumerate() {
             let anchor = 0..1 << (ix.bits[0] - 1);
-            let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
-            assert!(ok, "entry {k}: {:?}", ix.ix);
+            let ok = ix.bits[1] == 0
+                && ix.ix[1][1..] == [0; 15]
+                && anchor.contains(&ix.ix[0][0]);
+            assert!(ok, "entry {k}: bits={:?} ix={:?}", ix.bits, ix.ix);
         }
+    }
+
+    /// Optional differential check against the PC reference `BCPack.dll` when
+    /// `VICTORY_GDKX_TOOLS_DIR` points to a local tools folder.
+    #[test]
+    #[cfg(windows)]
+    fn matches_pc_bcpack_dll_if_present() {
+        use std::ffi::{OsStr, c_void};
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        let Some(dir) = std::env::var_os("VICTORY_GDKX_TOOLS_DIR") else {
+            return;
+        };
+        let dll_path = PathBuf::from(dir).join("BCPack.dll");
+        if !dll_path.is_file() {
+            return;
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+            fn FreeLibrary(module: *mut c_void) -> i32;
+        }
+        type CompressFn = unsafe extern "C" fn(
+            usize,
+            *mut usize,
+            *mut u8,
+            usize,
+            *const u8,
+            usize,
+        ) -> i32;
+        type DecompressFn = unsafe extern "C" fn(usize, *mut u8, usize, *const u8, usize) -> i32;
+
+        let wide: Vec<u16> = OsStr::new(&dll_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is NUL-terminated; symbol names are NUL-terminated C strings.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        assert!(!module.is_null(), "LoadLibraryW({}) failed", dll_path.display());
+        let compress: CompressFn = unsafe {
+            let p = GetProcAddress(module, c"BCPackCompress".as_ptr().cast());
+            assert!(!p.is_null(), "BCPackCompress missing");
+            std::mem::transmute(p)
+        };
+        let decompress: DecompressFn = unsafe {
+            let p = GetProcAddress(module, c"BCPackDecompress".as_ptr().cast());
+            assert!(!p.is_null(), "BCPackDecompress missing");
+            std::mem::transmute(p)
+        };
+
+        let tables = Tables::builtin().unwrap();
+
+        // Cover BC1, BC3, BC4, BC5, BC6H, and BC7 (including all 8 BC7 modes).
+        // Use correlated blocks so BCPackCompress achieves compression instead
+        // of returning E_FAIL on incompressible random noise, while still
+        // exercising both dictionary (i < 256) and history (i >= 256) refs.
+        for (bc, block_bytes, blocks) in [
+            (1u8, 8usize, 300usize),
+            (3, 16, 300),
+            (4, 8, 300),
+            (5, 16, 300),
+            (6, 16, 300),
+            (7, 16, 320),
+        ] {
+            let mut input = vec![0u8; blocks * block_bytes];
+            for (i, chunk) in input.chunks_exact_mut(block_bytes).enumerate() {
+                let g = ((i / 4) & 31) as u64;
+                let v = (i & 7) as u64;
+                if bc == 7 {
+                    let mode = ((i / 40) % 8) as u8;
+                    let mut w = Bits::default();
+                    w.put(1u64 << mode, u32::from(mode) + 1);
+                    let lo = (g << 4) | (g << 16) | (g << 28) | (v << 40);
+                    let hi = 0x0123_4567_89ab_cdefu64 ^ (v << 3);
+                    let rem = 128 - (u32::from(mode) + 1);
+                    let lo_bits = rem.min(64);
+                    w.put(lo, lo_bits);
+                    if rem > 64 {
+                        w.put(hi, rem - 64);
+                    }
+                    chunk.copy_from_slice(&w.v.to_le_bytes());
+                } else if bc == 6 {
+                    let (code, n) = BC6_CODE[1 + ((i / 22) % 14)];
+                    let mut w = Bits::default();
+                    w.put(code, n);
+                    let lo = (g << 2) | (g << 14) | (g << 26);
+                    let hi = 0x0101_2323_4545_6767u64 ^ (v << 4);
+                    let rem = 128 - n;
+                    w.put(lo, rem.min(64));
+                    if rem > 64 {
+                        w.put(hi, rem - 64);
+                    }
+                    chunk.copy_from_slice(&w.v.to_le_bytes());
+                } else {
+                    for (k, b) in chunk.iter_mut().enumerate() {
+                        *b = ((g as u8).wrapping_mul(5)).wrapping_add((k as u8).wrapping_mul(17))
+                            ^ (v as u8);
+                    }
+                }
+            }
+            let mut packed = vec![0u8; input.len() * 2 + 4096];
+            let mut packed_size = 0usize;
+            // SAFETY: valid buffers matching the documented BCPack.h contract.
+            let hr = unsafe {
+                compress(
+                    usize::from(bc),
+                    &mut packed_size,
+                    packed.as_mut_ptr(),
+                    packed.len(),
+                    input.as_ptr(),
+                    input.len(),
+                )
+            };
+            assert_eq!(hr, 0, "BCPackCompress(BC{bc}) failed: {hr:#x}");
+            packed.truncate(packed_size);
+
+            let mut ref_out = vec![0u8; input.len()];
+            // SAFETY: valid buffers matching BCPack.h.
+            let hr = unsafe {
+                decompress(
+                    usize::from(bc),
+                    ref_out.as_mut_ptr(),
+                    ref_out.len(),
+                    packed.as_ptr(),
+                    packed.len(),
+                )
+            };
+            assert_eq!(hr, 0, "BCPackDecompress(BC{bc}) failed: {hr:#x}");
+            assert_eq!(ref_out, input, "BCPack.dll round-trip mismatch on BC{bc}");
+
+            let mut ours = vec![0u8; input.len()];
+            decode(bc, &packed, &mut ours, &tables).unwrap();
+            assert_eq!(ours, ref_out, "victory-formats mismatch vs BCPack.dll on BC{bc}");
+        }
+
+        // SAFETY: loaded above.
+        unsafe { FreeLibrary(module) };
     }
 }

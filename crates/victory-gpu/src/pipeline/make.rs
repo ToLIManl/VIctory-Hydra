@@ -84,6 +84,14 @@ fn bvh_only_trace(shaders: &[Arc<Shader>]) -> bool {
         let has = |name: &[u8]| s.container.windows(name.len()).any(|w| w == name);
         (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH"))
             || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels") && !has(b"Fallback"))
+            || has(b"CS_ScreenProbes_EvaluateRayRequests_RayBinning")
+            || has(b"CS_ScreenProbes_GenerateRayBins")
+            || has(b"CS_ScreenProbes_GenerateShaderBins")
+            || has(b"CS_IrradianceCache_Shade_")
+            || has(b"CS_IrradianceCache_ShadeSecondary_")
+            || has(b"CS_IrradianceCache_ShadeVerify_")
+            || has(b"CS_IrradianceCache_GenerateShaderBins")
+            || has(b"CS_IrradianceCache_ShadowTrace")
     })
 }
 
@@ -879,6 +887,7 @@ mod tests {
                 container: name.to_vec(),
                 hair: false,
                 ambient: None,
+                native_wave64: false,
                 translated: OnceLock::new(),
             })]
         };
@@ -889,12 +898,24 @@ mod tests {
         assert!(!bvh_only_skin(&shader("compute", b"CS_PosOnlyLodSkinning_foo")));
         assert!(!bvh_only_skin(&shader("compute", b"computeclothSkinning")));
 
-        // BVH-only ray traces match, never Voxels/Fallback forms.
+        // BVH-only ray traces & ray/shader binning match, never Voxels/Fallback or screen-space GI forms.
         assert!(bvh_only_trace(&shader("compute", b"CS_ScreenProbes_TraceRays_BVH_Wrapped")));
         assert!(bvh_only_trace(&shader("compute", b"CS_RaytraceVBuffer_Primary")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_ScreenProbes_EvaluateRayRequests_RayBinning_19e9e6fd")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_ScreenProbes_GenerateRayBins_66d8f8f6")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_ScreenProbes_GenerateShaderBins_f54cc70b")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_IrradianceCache_Shade_823aad37_Wrapped")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_IrradianceCache_ShadeSecondary_be14e72d")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_IrradianceCache_ShadeVerify_5a51983c")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_IrradianceCache_GenerateShaderBins_52e4d3db")));
+        assert!(bvh_only_trace(&shader("compute", b"CS_IrradianceCache_ShadowTrace_WithFar")));
         assert!(!bvh_only_trace(&shader("compute", b"CS_ScreenProbes_TraceRays_Voxels")));
         assert!(!bvh_only_trace(&shader("compute", b"CS_ScreenProbes_TraceRays_Fallback")));
         assert!(!bvh_only_trace(&shader("compute", b"CS_RaytraceVBuffer_Voxels_RayBinning")));
+        assert!(!bvh_only_trace(&shader("compute", b"CS_ScreenProbes_TemporalResolve_ReflectiveCaustics")));
+        assert!(!bvh_only_trace(&shader("compute", b"CS_ScreenProbes_ResolveGBuffer_75aa1158")));
+        assert!(!bvh_only_trace(&shader("compute", b"CS_IrradianceCache_ShadeCopy_655606bd")));
+        assert!(!bvh_only_trace(&shader("compute", b"CS_GenerateShaderBins_Tiled_f41afb81")));
 
         // All decoration/face bake permutations match scene_input eagerly.
         assert!(scene_input(&shader("pixel", b"PS_DecorationBlend_0011")));

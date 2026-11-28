@@ -36,7 +36,21 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
-/// The factory interface the title asks for.
+/// `IDStorageFactoryX` (`dstorage_xs.h:781`).
+const FACTORY_X: Guid = Guid::new(
+    0xfb3b_54ac,
+    0xbf82,
+    0x463a,
+    [0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d],
+);
+/// `IDStorageFactoryX1` (`dstorage_xs.h:850`).
+const FACTORY_X1: Guid = Guid::new(
+    0xc74c_2a5b,
+    0x1e43,
+    0x46a5,
+    [0xa2, 0x24, 0x91, 0x16, 0x35, 0x8e, 0x11, 0x18],
+);
+/// `IDStorageFactoryX2` (`dstorage_xs.h:865`), the interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -57,7 +71,7 @@ static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE)
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
-        Some(&iid) if iid == FACTORY => {
+        Some(&iid) if iid == FACTORY || iid == FACTORY_X1 || iid == FACTORY_X => {
             put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
         }
         iid => {
@@ -185,34 +199,61 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// `DSTORAGE_QUEUE_OPTIONS::AutoSubmitDisabled` (`dstorage_xs.h:98`).
+const QUEUE_OPTION_AUTO_SUBMIT_DISABLED: u64 = 1;
+
+/// `DSTORAGE_QUEUE_DESC` (`dstorage_xs.h:67`, 0x18 bytes on x64).
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueDescBase {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+const _: () = assert!(size_of::<QueueDescBase>() == 0x18);
+
+/// `DSTORAGE_QUEUE_DESC1` (`dstorage_xs.h:112`, 0x20 bytes on x64):
+/// base description plus `DSTORAGE_QUEUE_OPTIONS` (bit 0 = `AutoSubmitDisabled`).
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+const _: () = assert!(size_of::<QueueDesc>() == 0x20);
 
-extern "system" fn create_queue(
-    _: Factory,
-    desc: *const QueueDesc,
-    iid: *const Guid,
-    out: Out,
-) -> HRESULT {
-    // SAFETY: the title passes its description (null tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
+/// `DSTORAGE_QUEUE_INFO` (`dstorage_xs.h:143`, 0x20 bytes on x64).
+#[repr(C)]
+struct QueueInfo {
+    desc: QueueDescBase,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+const _: () = assert!(size_of::<QueueInfo>() == 0x20);
+
+/// `DSTORAGE_QUEUE_INFO1` (`dstorage_xs.h:167`, 0x28 bytes on x64).
+#[repr(C)]
+struct QueueInfo1 {
+    desc: QueueDesc,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+const _: () = assert!(size_of::<QueueInfo1>() == 0x28);
+
+fn create_queue_inner(desc: &QueueDesc, iid: *const Guid, out: Out) -> HRESULT {
     let name = text(desc.name);
+    let auto_submit_disabled = desc.options & QUEUE_OPTION_AUTO_SUBMIT_DISABLED != 0;
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        options = desc.options,
+        auto_submit_disabled,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -222,7 +263,7 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let mut lane = Lane::new(desc.priority, desc.capacity);
+    let mut lane = Lane::with_desc(*desc);
     if error_record::enabled() {
         let Some(record) = error_record::Errors::new() else {
             return E_OUTOFMEMORY;
@@ -239,6 +280,39 @@ extern "system" fn create_queue(
             Queue { id, errors },
         ),
     )
+}
+
+extern "system" fn create_queue_base(
+    _: Factory,
+    desc: *const QueueDescBase,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
+    // SAFETY: the title passes its description (null tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let desc1 = QueueDesc {
+        source_type: desc.source_type,
+        capacity: desc.capacity,
+        priority: desc.priority,
+        name: desc.name,
+        options: 0,
+    };
+    create_queue_inner(&desc1, iid, out)
+}
+
+extern "system" fn create_queue(
+    _: Factory,
+    desc: *const QueueDesc,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
+    // SAFETY: the title passes its description (null tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    create_queue_inner(desc, iid, out)
 }
 
 /// The title asks for 32 MiB and stops if this fails. Give PC worker threads
@@ -273,14 +347,14 @@ static FACTORY_VTABLE: Methods<16> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),            // 0x18 (2020: queue creation)
+    create_queue_base as *const (),       // 0x18 IDStorageFactoryX::CreateQueue
     open_file as *const (),               // 0x20
     create_status_array as *const (),     // 0x28
     missing::<6> as *const (),            // 0x30 (2020: CPU affinity)
     missing::<7> as *const (),            // 0x38 (2020: debug flags)
     set_staging_buffer_size as *const (), // 0x40
-    missing::<9> as *const (),
-    create_queue as *const (), // 0x50
+    missing::<9> as *const (),            // 0x48 IDStorageFactoryX1::GetStats
+    create_queue as *const (),            // 0x50 IDStorageFactoryX2::CreateQueue1
     missing::<11> as *const (),
     missing::<12> as *const (),
     missing::<13> as *const (),
@@ -656,6 +730,7 @@ struct Lanes {
 struct Lane {
     class: usize,
     capacity: usize,
+    desc: QueueDesc,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
@@ -1116,10 +1191,22 @@ fn sort_batch_for_hdd(commands: &mut [Command]) {
 }
 
 impl Lane {
+    #[cfg(test)]
     fn new(priority: i8, capacity: u16) -> Lane {
+        Lane::with_desc(QueueDesc {
+            source_type: 0,
+            capacity,
+            priority,
+            name: std::ptr::null(),
+            options: 0,
+        })
+    }
+
+    fn with_desc(desc: QueueDesc) -> Lane {
         Lane {
-            class: priority.clamp(-1, 1).wrapping_add(1) as usize,
-            capacity: usize::from(capacity),
+            class: desc.priority.clamp(-1, 1).wrapping_add(1) as usize,
+            capacity: usize::from(desc.capacity),
+            desc,
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
@@ -1129,6 +1216,25 @@ impl Lane {
             errors: None,
             closed: false,
         }
+    }
+
+    fn auto_submit_disabled(&self) -> bool {
+        self.desc.options & QUEUE_OPTION_AUTO_SUBMIT_DISABLED != 0
+    }
+
+    fn empty_slot_count(&self) -> u16 {
+        let usable = self.capacity.saturating_sub(1);
+        usable.saturating_sub(self.entries()).min(u16::MAX as usize) as u16
+    }
+
+    fn request_count_until_auto_submit(&self) -> u16 {
+        if self.auto_submit_disabled() || !half_submits() {
+            return u16::MAX;
+        }
+        let threshold = (self.capacity / 2).max(1);
+        threshold
+            .saturating_sub(self.unsubmitted.len())
+            .min(u16::MAX as usize) as u16
     }
 
     /// Approach after XCL 66660bd: cancellation removes matching reads that
@@ -1676,7 +1782,10 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if !lane.auto_submit_disabled()
+        && half_submits()
+        && lane.unsubmitted.len() >= (lane.capacity / 2).max(1)
+    {
         lanes.submit(id, true);
         scheduler.work.notify_all();
     }
@@ -2223,19 +2332,63 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
     pages
 }
 
-/// Slots by the 2020 order, which the argument shapes at
-/// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-fn queue_table() -> &'static Methods<12> {
+/// Slots per `IDStorageQueueX` / `X1` / `X2` (`dstorage_xs.h:927-1034`).
+fn queue_table() -> &'static Methods<14> {
     static CANCEL: LazyLock<bool> = LazyLock::new(|| {
         std::env::var_os("VICTORY_DSTORAGE_CANCEL").is_some_and(|v| v == "1")
     });
-    static TABLES: [Methods<12>; 4] = [
+    static TABLES: [Methods<14>; 4] = [
         methods(false, false),
         methods(true, false),
         methods(false, true),
         methods(true, true),
     ];
     &TABLES[usize::from(*CANCEL) + 2 * usize::from(error_record::enabled())]
+}
+
+extern "system" fn query_queue(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    let Some(scheduler) = scheduler() else { return };
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get(&id) else {
+        return;
+    };
+    let out = QueueInfo {
+        desc: QueueDescBase {
+            source_type: lane.desc.source_type,
+            capacity: lane.desc.capacity,
+            priority: lane.desc.priority,
+            name: lane.desc.name,
+        },
+        empty_slot_count: lane.empty_slot_count(),
+        request_count_until_auto_submit: lane.request_count_until_auto_submit(),
+    };
+    // SAFETY: checked non-null; caller provides `DSTORAGE_QUEUE_INFO`.
+    unsafe { info.write(out) };
+}
+
+extern "system" fn query_queue1(this: QueueRef, info: *mut QueueInfo1) {
+    if info.is_null() {
+        return;
+    }
+    let Some(scheduler) = scheduler() else { return };
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get(&id) else {
+        return;
+    };
+    let out = QueueInfo1 {
+        desc: lane.desc,
+        empty_slot_count: lane.empty_slot_count(),
+        request_count_until_auto_submit: lane.request_count_until_auto_submit(),
+    };
+    // SAFETY: checked non-null; caller provides `DSTORAGE_QUEUE_INFO1`.
+    unsafe { info.write(out) };
 }
 
 extern "system" fn cancel(this: QueueRef, mask: u64, value: u64) {
@@ -2248,20 +2401,22 @@ extern "system" fn cancel(this: QueueRef, mask: u64, value: u64) {
     scheduler.finished.notify_all();
 }
 
-const fn methods(cancel_reads: bool, errors: bool) -> Methods<12> {
+const fn methods(cancel_reads: bool, errors: bool) -> Methods<14> {
     Methods([
         missing::<0> as *const (),
         add_ref_instance::<Queue> as *const (),
         release::<Queue> as *const (),
         enqueue_request as *const (), // 0x18
         enqueue_status as *const (),  // 0x20
-        missing::<5> as *const (),    // 0x28 (2020: fence signal)
+        missing::<5> as *const (),    // 0x28 EnqueueSignal
         submit as *const (),          // 0x30
         if cancel_reads { cancel as *const () } else { missing::<7> as *const () },
         close as *const (),           // 0x40
         if errors { error_record::event as *const () } else { missing::<9> as *const () },
         if errors { error_record::retrieve as *const () } else { missing::<10> as *const () },
-        missing::<11> as *const (),   // 0x58 (2020: queue info)
+        query_queue as *const (),     // 0x58 IDStorageQueueX::Query
+        missing::<12> as *const (),   // 0x60 IDStorageQueueX1::EnqueueSetEvent
+        query_queue1 as *const (),    // 0x68 IDStorageQueueX2::Query1
     ])
 }
 
@@ -2329,7 +2484,7 @@ mod tests {
             capacity: 0x80,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options: QUEUE_OPTION_AUTO_SUBMIT_DISABLED,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -2408,7 +2563,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -2553,7 +2708,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"small".as_ptr(),
-            unknown: 1,
+            options: QUEUE_OPTION_AUTO_SUBMIT_DISABLED,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -3263,5 +3418,92 @@ mod tests {
         );
         // `Status` in this synthetic test has a null `array`; skip its COM release Drop.
         std::mem::forget(cmds);
+    }
+
+    #[test]
+    fn query_and_query1_report_empty_slots_and_auto_submit_disabled() {
+        // Verify factory accepts IDStorageFactoryX, X1, and X2.
+        for iid in [&FACTORY_X, &FACTORY_X1, &FACTORY] {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(iid, &mut f), S_OK);
+            assert!(!f.is_null());
+        }
+        let create1: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 16,
+            priority: 1,
+            name: c"q1".as_ptr(),
+            options: QUEUE_OPTION_AUTO_SUBMIT_DISABLED,
+        };
+        let mut q = std::ptr::null_mut();
+        assert_eq!(create1(factory(), &desc, std::ptr::null(), &mut q), S_OK);
+
+        let query: extern "system" fn(*mut c_void, *mut QueueInfo) = call(q, 0x58);
+        let query1: extern "system" fn(*mut c_void, *mut QueueInfo1) = call(q, 0x68);
+        let mut info = std::mem::MaybeUninit::<QueueInfo>::zeroed();
+        let mut info1 = std::mem::MaybeUninit::<QueueInfo1>::zeroed();
+        query(q, info.as_mut_ptr());
+        query1(q, info1.as_mut_ptr());
+        // SAFETY: initialized by `query`/`query1`.
+        let (info, info1) = unsafe { (info.assume_init(), info1.assume_init()) };
+        assert_eq!(info.desc.capacity, 16);
+        assert_eq!(info.empty_slot_count, 15);
+        assert_eq!(info.request_count_until_auto_submit, u16::MAX);
+        assert_eq!(info1.desc.options, QUEUE_OPTION_AUTO_SUBMIT_DISABLED);
+        assert_eq!(info1.empty_slot_count, 15);
+        assert_eq!(info1.request_count_until_auto_submit, u16::MAX);
+
+        // Enqueue > half capacity (10 reads to physical pages whose page list is
+        // populated ONLY after enqueue and before explicit Submit): must stay
+        // unsubmitted and succeed cleanly once Submit is called.
+        use crate::modules::xmem;
+        let plain = pattern(4096);
+        let (_dir, file) = file_with(&plain);
+        let mut pages = [0usize; 10];
+        let mut count = 10;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        let mut page_lists = [[0usize; 1]; 10]; // initially page 0 (unmapped)
+        for list in &mut page_lists {
+            enqueue(
+                q,
+                &request(
+                    PAGE_DESTINATION,
+                    list.as_mut_ptr().cast(),
+                    plain.len(),
+                    file,
+                    0,
+                    plain.len(),
+                ),
+            );
+        }
+        let array = status_array(1);
+        enqueue_status(q, array, 0);
+        let mut mid_info1 = std::mem::MaybeUninit::<QueueInfo1>::zeroed();
+        query1(q, mid_info1.as_mut_ptr());
+        // SAFETY: initialized by `query1`.
+        let mid_info1 = unsafe { mid_info1.assume_init() };
+        assert_eq!(mid_info1.empty_slot_count, 15 - 11);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(result(array, 0), E_PENDING, "AutoSubmitDisabled must not auto-submit");
+
+        // Populate physical page lists AFTER enqueue, BEFORE explicit Submit.
+        for (list, &page) in page_lists.iter_mut().zip(&pages) {
+            list[0] = page;
+        }
+        void(q, 0x30); // Submit
+        assert_eq!(wait(array, 0), S_OK);
+        for &page in &pages {
+            let got = xmem::page_window(&[page], 0, plain.len())
+                .unwrap()
+                .bytes()
+                .to_vec();
+            assert_eq!(got, plain);
+        }
+        void(q, 0x40); // Close
     }
 }

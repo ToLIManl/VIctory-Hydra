@@ -129,8 +129,16 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Enhanced barrier group breakdown (`ID3D12GraphicsCommandList7::Barrier`):
+    /// individual global/texture/buffer entries parsed, calls skipped with zero
+    /// UAV barriers, and scoped texture UAV barriers emitted.
+    EnhancedGlobal,
+    EnhancedTexture,
+    EnhancedBuffer,
+    EnhancedSkipped,
+    EnhancedScoped,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 88;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1346,11 +1354,17 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each); barrier experiment {}; enhanced groups: {:.0} global / {:.0} tex / {:.0} buf \
+         ({:.0} calls skipped, {:.0} scoped tex UAV)",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
-        barrier_test()
+        barrier_test(),
+        c[C::EnhancedGlobal as usize],
+        c[C::EnhancedTexture as usize],
+        c[C::EnhancedBuffer as usize],
+        c[C::EnhancedSkipped as usize],
+        c[C::EnhancedScoped as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

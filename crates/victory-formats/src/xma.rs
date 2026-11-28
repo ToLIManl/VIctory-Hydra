@@ -44,11 +44,12 @@ impl std::error::Error for Error {}
 
 // Packets.
 
-/// A packet's header fields.
+/// A packet's header fields (`XMA2PACKET`, `xma2defs.h:317,348-351`).
 #[derive(Debug, Clone, Copy)]
 pub struct Packet {
     pub frames: u32,
     pub first_frame_bit: u32,
+    pub metadata: u8,
     pub skip: u32,
 }
 
@@ -59,6 +60,7 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     Some(Packet {
         frames: h >> 26,
         first_frame_bit: (h >> 11) & 0x7fff,
+        metadata: ((h >> 8) & 0x7) as u8,
         skip: h & 0xff,
     })
 }

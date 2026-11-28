@@ -301,6 +301,7 @@ pub(crate) fn record_batch(
     let chunk_cap = scratch_size.min(cap).max(max_item);
 
     let _pix = crate::pix::Scope::begin(cmd_list, c"VIctory: GPU Detile (batch)");
+    let gpu_tok = crate::gpu_prof::begin(cmd_list, crate::gpu_prof::PassKind::Detile, 0, false);
     host_list.keep(&scratch);
 
     let mut detiled_count = 0u64;
@@ -424,6 +425,7 @@ pub(crate) fn record_batch(
         }
     }
 
+    crate::gpu_prof::end(cmd_list, gpu_tok);
     TEXTURES_DETILED.fetch_add(detiled_count, Ordering::Relaxed);
     BYTES_DETILED.fetch_add(detiled_bytes, Ordering::Relaxed);
     failed

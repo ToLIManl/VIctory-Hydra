@@ -69,6 +69,10 @@ impl Mode {
 struct Task {
     context: usize,
     callback: usize,
+    /// Owning [`Queue`] address so terminating a composite queue only cancels
+    /// tasks submitted through that queue, leaving sibling queues' tasks on a
+    /// shared port intact.
+    owner: usize,
 }
 
 impl Task {
@@ -76,6 +80,7 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            owner: 0,
         }
     }
 
@@ -211,7 +216,7 @@ impl Queue {
         })
     }
 
-    fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
+    fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, mut task: Task) -> HRESULT {
         static NEXT_DELAYED: AtomicU64 = AtomicU64::new(0);
         if port > COMPLETION {
             return E_INVALIDARG;
@@ -219,6 +224,7 @@ impl Queue {
         if self.terminated.load(Ordering::Acquire) {
             return E_ABORT;
         }
+        task.owner = Arc::as_ptr(self) as usize;
         if delay_ms == 0 {
             self.deliver(port, task);
             return S_OK;
@@ -400,8 +406,22 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    let me = Arc::as_ptr(&queue) as usize;
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let mut pending = Vec::new();
+        {
+            let mut tasks = lock(&port.tasks);
+            let mut i = 0;
+            while i < tasks.len() {
+                if tasks[i].owner == me {
+                    if let Some(task) = tasks.remove(i) {
+                        pending.push(task);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
@@ -1660,5 +1680,36 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_composite_queue_preserves_sibling_tasks_on_shared_port() {
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: each callback receives a pointer to a local u8 slot.
+            unsafe { *context.cast::<u8>() = if canceled { 2 } else { 1 } };
+        }
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+
+        let (mut state_a, mut state_b) = (0u8, 0u8);
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, (&mut state_a as *mut u8).cast(), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, WORK, 0, (&mut state_b as *mut u8).cast(), Some(record)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(b, true, std::ptr::null_mut(), None), S_OK);
+        assert_eq!(state_b, 2, "terminated composite queue's task must be canceled");
+        assert_eq!(state_a, 0, "sibling queue's task on shared port must stay queued");
+        assert!(XTaskQueueDispatch(a, WORK, 0));
+        assert_eq!(state_a, 1, "sibling queue's task must run normally");
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
     }
 }

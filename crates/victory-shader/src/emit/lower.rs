@@ -353,6 +353,17 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Intra-block `split_lds` barrier elision phase (active only under `opt::BARRIERS`).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SplitLdsPhase {
+    #[default]
+    Unknown,
+    /// Immediately after a group-syncing `s_barrier` (with no intervening LDS op).
+    Synced,
+    /// After a `split_lds` meeting + `ds_read*` with no intervening LDS write/atomic.
+    Reading,
+}
+
 struct Lower<'a> {
     s: Shader,
     window_properties: u32,
@@ -425,6 +436,11 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// Intra-block synchronization phase for `split_lds` when `opt::BARRIERS` is on:
+    /// avoids emitting redundant `dx.op.barrier` calls between consecutive `ds_read*`
+    /// instructions (whose bounds-check branch diamonds hide them from intra-block
+    /// bitcode barrier coalescing) or immediately after an explicit group-syncing `s_barrier`.
+    split_lds_phase: SplitLdsPhase,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -2100,6 +2116,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            split_lds_phase: SplitLdsPhase::Unknown,
             lds_meet,
             lds_looped,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2825,6 +2842,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.split_lds_phase = SplitLdsPhase::Unknown;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -4680,6 +4698,7 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        self.split_lds_phase = SplitLdsPhase::Unknown;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6143,10 +6162,33 @@ impl<'a> Lower<'a> {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten (not in a loop
             // the host waves take each on its own: there a fence, no wait)
-            let mode = if self.lds_looped.contains(&(b, i)) { 8 } else { meeting_mode() };
-            let mode = self.s.m.i32(mode);
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let looped = self.lds_looped.contains(&(b, i));
+            let is_read = name.starts_with("ds_read");
+            let opt_barriers = super::shader_opt() & super::bitcode::opt::BARRIERS != 0;
+            let skip = opt_barriers
+                && !looped
+                && (self.split_lds_phase == SplitLdsPhase::Synced
+                    || (is_read && self.split_lds_phase == SplitLdsPhase::Reading));
+            if !skip {
+                let mode = if looped { 8 } else { meeting_mode() };
+                let mode = self.s.m.i32(mode);
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
+            self.split_lds_phase = if !looped && is_read {
+                SplitLdsPhase::Reading
+            } else {
+                SplitLdsPhase::Unknown
+            };
+        } else if matches!(
+            inst.fields,
+            Fields::Buffer { .. }
+                | Fields::Image { .. }
+                | Fields::Flat { .. }
+                | Fields::Smem { .. }
+                | Fields::Exp { .. }
+        ) {
+            self.split_lds_phase = SplitLdsPhase::Unknown;
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -6181,6 +6223,11 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.split_lds_phase = if waits {
+                    SplitLdsPhase::Synced
+                } else {
+                    SplitLdsPhase::Unknown
+                };
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -6228,6 +6275,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.split_lds_phase = SplitLdsPhase::Unknown;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
