@@ -388,12 +388,44 @@ impl Memory {
         true
     }
 
-    /// Another arena's pages.
+    /// Another arena's pages (port of VIctory-NVIDIA PR #88 `30b979e`,
+    /// GPL-3.0-or-later): after a failure, none is tried again before the next
+    /// frame, and a reservation whose copy could not be made is freed.
     fn another(&mut self) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static FAILED: AtomicU64 = AtomicU64::new(u64::MAX);
+        static WHY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let frame = crate::frame::current();
+        if FAILED.load(Relaxed) == frame {
+            return false;
+        }
+        let arenas = self.arenas.len();
+        let failed = |why: usize| {
+            FAILED.store(frame, Relaxed);
+            let n = WHY[why].fetch_add(1, Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    arenas,
+                    times = n,
+                    "title memory by address: no other arena ({}); none tried again this frame",
+                    ["the address range has no room for one", "its copy could not be made"][why]
+                );
+            }
+        };
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
+            failed(0);
             return false;
         };
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+            failed(1);
+            // SAFETY: the reservation just made, which nothing else knows of.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualFree(
+                    at as *mut _,
+                    0,
+                    windows_sys::Win32::System::Memory::MEM_RELEASE,
+                );
+            }
             return false;
         };
         self.arenas.push((n, at));

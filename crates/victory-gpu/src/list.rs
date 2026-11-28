@@ -732,6 +732,8 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
+    // (On the thread that recorded the list's draws, thin or not.)
+    flush_counts();
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         // SAFETY: `this` is a valid `List` pointer when `host_list` succeeds.
@@ -907,6 +909,22 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
+        let state = crate::host::legal_state(texture, state);
+        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.barriers(&[barrier]) };
+    }
+}
+
+/// As [`ensure_state`], for a host copy the caller has already asked for.
+#[cfg(windows)]
+pub(crate) fn ensure_copy_state(
+    list: &crate::host::HostList,
+    copy: &std::sync::Arc<crate::resource::HostTexture>,
+    state: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((texture, before)) = list.transition_copy(copy, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -1946,8 +1964,38 @@ mod state {
     pub(super) use super::ignored_state as viewports;
 }
 
+/// Draws go into [`DRAWS`] this many at a time from each recording thread
+/// (one shared line written per draw from all of them cost more than the
+/// count), and the rest when the thread closes a list ([`flush_counts`]).
+const DRAWS_BATCH: u64 = 256;
+
+thread_local! {
+    /// This thread's draws not yet in [`DRAWS`].
+    static LOCAL_DRAWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
 fn count_draw() {
-    DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LOCAL_DRAWS.with(|n| {
+        let draws = n.get() + 1;
+        if draws >= DRAWS_BATCH {
+            DRAWS.fetch_add(draws, std::sync::atomic::Ordering::Relaxed);
+            n.set(0);
+        } else {
+            n.set(draws);
+        }
+    });
+}
+
+/// Puts this thread's draw counts into the totals: at the end of each list
+/// it records, so a frame's counts are whole by its present.
+fn flush_counts() {
+    let draws = LOCAL_DRAWS.with(|n| n.replace(0));
+    if draws != 0 {
+        DRAWS.fetch_add(draws, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(windows)]
+    crate::draw::flush_counts();
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and

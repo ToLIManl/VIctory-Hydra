@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 pub(crate) enum Param {
     /// `RootConstants(num32BitConstants=count, b<register>)`.
     Constants { register: u32, count: u32 },
+    /// `SRV(t<register>)`: a root descriptor.
+    Srv(u32),
     /// `UAV(u<register>)`: a root descriptor.
     Uav(u32),
     /// `DescriptorTable(SRV(t<register>, numDescriptors=count))`.
@@ -57,6 +59,17 @@ pub(crate) fn make(device: &ID3D12Device, params: &[Param], what: &str) -> windo
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: register, RegisterSpace: 0, Num32BitValues: count },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            Param::Srv(register) => D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: register,
+                        RegisterSpace: 0,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                    },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },

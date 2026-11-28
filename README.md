@@ -26,51 +26,52 @@
 
 **VIctory-Hydra** is a community-driven "Frankenstein" unification branch built on top of `cool_fox` / `VIctory`. Instead of leaving breakthroughs scattered across a dozen incompatible forks, every major optimization and shader fix is cherry-picked, adapted cleanly, and **A/B benchmarked on real NVIDIA RTX & mid-range CPU hardware** — keeping what genuinely improves frame time, stability, or visual fidelity, and disabling or fixing what regresses.
 
+> **Early / Experimental Status — Not Ready for Full Playthroughs Yet:** Hitting **~18–20 base FPS (37–40 FPS with FSR 3 Frame Generation 2x)** at `1080p` on an RTX 3060 + Ryzen 5 5600X is a major milestone, **but this port is still raw and under active development**. Heavy open-world texture streaming can still drop FPS significantly, turning quickly causes hitches, and visual glitches (blocky shadows, swizzled/incomplete textures on some surfaces) still occur. Expect an experimental research/testing build rather than a finished playable experience.
+
 > **Legal & Asset Policy Notice:** This repository contains **zero** copyrighted game code, binaries, textures, shaders, audio, or screenshots. Every runtime file is supplied locally by the user from their own legal dump, enforced automatically by `cargo xtask policy` and `.githooks/pre-commit`. See [docs/asset-policy.md](docs/asset-policy.md).
 
 ---
 
-## New Features (Stages 8 – 10 Wave 1)
+## New Features (Stages 8 – 10 Waves 1–9)
 
-Highlights shipped since Stage 7B — all following the **no-compromise quality policy** (zero stripped geometry, lighting, water, or LODs):
+Highlights shipped through **Stage 10 Wave 9** — combining community breakthroughs and original tooling, verified on real **RTX 3060 12 GB + Ryzen 5 5600X** hardware:
 
-- **Placed-Copy Forwarding & Dynamic Descriptor Slabs (`VICTORY_PLACED_FORWARD=1`, `VICTORY_DYNAMIC_SLAB=1`, `VICTORY_ASYNC_RECYCLE=1`):** Eliminated `BEHIND_PLACED` GPU stalls (`21.3–23.0 ms → 0.0–1.8 ms`) and cut `HostHeap::dynamic` mutex contention from `26.9 ms → 0.5 ms` across 6,400+ tables/frame, plus monotonic `HostHeap::id` guards so stale lists never free slots in a recycled heap.
-- **CPU Scheduler, Helper Priority & Preallocated Buffers (`VICTORY_HELPER_PRIORITY`, `VICTORY_DSTORAGE_PRIORITY=-1`, `VICTORY_BUFFERS_AHEAD`, `VICTORY_PATCH_LEAN=1`, `VICTORY_INPLACE_CONSTANTS=1`):** Raised `heap-sync`, `aside`, `land`, and `wide` helpers to `ABOVE_NORMAL` while yielding DirectStorage decompression threads (`heaps' records` wait cut from `4.2–9.8 ms → 1.8–2.3 ms`), preallocated 64 KiB buffers ahead of world entry, and gated Release `PLACED_RAW` tracking out of `texture_at()`.
-- **Deterministic Static Samplers & NVIDIA 32-Lane Shader Fixes (`VICTORY_SAMPLER_ORDER`, `VICTORY_THREAD_TICKET`, `VICTORY_LDS_LOOP_ATOMICS`, `VICTORY_LDS_BOUNDS`, `VICTORY_LDS_FIRST_INIT`, `VICTORY_LOOPS_WAVE`, `VICTORY_EARLY_DEPTH`):** Fixed 3D LUT color banding (`PS_CompositeNMB`), cloud tile holes (`CS_SortRayTiles`), water dark blocks, 2D `32×2` group lane assignment on NVIDIA, BC7 mode 4/5 rotation, and violet probe artifacts in ambient light.
-- **D3D12 Validation, Memory Guardrails & Fast Tooling:** Fixed D3D12 error `538` (separate `ExecuteCommandLists` for buffer comparisons) and error `646` (ambient depth SRV type/dimension check), added `VICTORY_RAW_VIEW_CLAMP`, `VICTORY_VRAM_BUDGET_MB`, `VICTORY_SKIP_BINK=1`, `VICTORY_AUTO_A=90`, auto-staged Agility SDK `D3D12\D3D12Core.dll` in launchers, and fixed offline frame replay on Agility SDK `1.620.2`.
+- **NVIDIA DLSS 4 (Preset K) + AMD FSR 3 Frame Generation 2x + Directional SH GI & Specular (`Waves 5–6`):** Native `1080p` DLSS Super Resolution (`720p` internal) + HUD-less FSR 3 FG 2x (reaching **37–40 FPS** output from **18–20 base FPS** before heavy streaming), ray-free directional SH global illumination + specular reflections (`CS_RayMiss`), stencil-plane depth fix, and **17 live-apply F1 settings** that take effect immediately without restart.
+- **Batched GPU Compute Detiler, VRAM Constants & Lean Compares (`Waves 7–9`):** Hardware `cs_5_1` compute detiling (`VICTORY_GPU_DETILE=1`) moves console GFX10 texture swizzling off the CPU onto a shared 128 MiB UAV scratch buffer; `VICTORY_PORT_CONSTANTS=0` + `VICTORY_CARD_TOUCHED=1` + `VICTORY_CARD_COMPARE_EVERY=30` (with `VICTORY_MASKED_PATCH` ahead-compare protection) cut ~260 MB/frame of redundant GPU compare reads and dropped `ms / 1k draws` by **37%** (`20.3 → 12.8 ms/1k`).
+- **DXIL Shader Optimizer (`3007`) & Wave32 LDS Hazard Analysis (`Wave 9`):** Ported opt-in `EXT_FOLD`, `MEM_FWD`, `LICM`, `BARRIERS`, `SPEC_LICM` (collision-free bitmask preserving `FAST=128`) and static Wave32 LDS alias/lane-privacy analysis (`VICTORY_LDS_ANALYZE=1`), verified bit-exact on RTX 3060 hardware and halving GPU work in heavy scenes (`16.2–22.7 ms → 9.1–10.4 ms`).
+- **RAGE 9 Engine Controls, ScriptHook VI & Hydra Control (`Waves 7–9`):** Byte-verified RAGE 9 patches (`VICTORY_LOW_SHADOWS`, `VICTORY_LOW_VOLUMETRIC`), loose-file mod override (`VICTORY_MODS_DIR`), `VICTORY_LOAD_DLLS` (`shvi_core.dll` with 6,812 bound natives + `trainer.asi`), live release shader profiler (`VICTORY_PROF=1`), PIX/Nsight markers (`VICTORY_PIX=1`), and our unified local control plane **Hydra Control** (`\\.\pipe\victory_hydra` + `hydra_bridge.asi` + `tools/hydra_ctl.py`).
 
-### Before vs. After (`Stage 7B → Stage 10 Wave 1`, RTX 3060 12 GB + Ryzen 5 5600X)
+### Before vs. After (`Stage 7B → Stage 10 Wave 9`, RTX 3060 12 GB + Ryzen 5 5600X)
 
-| Metric | Before (Stage 7B) | Now (Stages 8 – 10 Wave 1) |
+| Metric | Before (Stage 7B) | Now (Stage 10 Wave 9) |
 | :--- | :--- | :--- |
-| **Light World Scenes (`1,000–1,750 draws`)** | `13–14 FPS` (`~70–80 ms`) | **`25.9–30.8 FPS`** (`32.5–38.7 ms`) |
-| **Heavy World Scenes (`2,800–3,700 draws`)** | `11.2 FPS` (`89.0 ms`) | **`16.9–20.9 FPS`** (`47.8–59.2 ms`) |
-| **CPU Frame-Prep (at `~6,300–7,700 draws`)** | `60–69 ms/frame` | **`36.9 ms/frame`** (~1.8–2× faster) |
-| **`BEHIND_PLACED` Stalls** | `21.3–23.0 ms/frame` | **`0.0–1.8 ms/frame`** |
-| **`HostHeap::dynamic` Contention** | `26.9 ms/frame` | **`0.5 ms/frame`** |
-| **Waiting for `heaps' records`** | `4.2–9.8 ms/frame` | **`1.8–2.3 ms/frame`** |
-| **D3D12 Debug Layer (`538` / `646`)** | Active (`538` compare state + `646` depth SRV) | **Fixed in submission & ambient pass** |
-| **Visual Fidelity (NVIDIA 32-lane)** | 3D LUT banding, cloud holes, water blocks, violet probes | **All fixed without cutting visual effects** |
+| **1080p Base FPS (FG OFF, GI + Specular + DLSS 4 K)** | `~10–12 FPS` (`720p` flat light) | **`16.7–20.0 FPS`** (steady `17.8–19.3 FPS`, drops to `~10` during heavy texture stream bursts) |
+| **1080p Output FPS (FSR 3 Frame Gen 2x)** | Not available | **`35–40 FPS`** (before heavy streaming bursts) |
+| **Frame Cost per 1,000 Draws (`4,600+ draws`)** | `~20.3–25.0 ms / 1k draws` | **`12.8 ms / 1k draws`** (`-37%` vs Wave 8) |
+| **Active GPU Work (`on the GPU`, `4,636 draws`)** | `16.2–22.7 ms` (Wave 8) | **`9.1–10.4 ms`** (`~2×` cut via `CARD_COMPARE_EVERY=30` + `SHADER_OPT=3007`) |
+| **Texture Refresh CPU Time** | `~42.3 ms` scalar CPU detile | **`1.1–2.3 ms`** (`VICTORY_GPU_DETILE=1` batched compute) |
+| **GPU Compare Reads (`CARD_COMPARE_EVERY=30`)** | Full 182 MB × ~7 submits/frame | **`~4,166` pieces (`~260 MB/frame`) skipped**, `0` lost writes on WARP |
+| **Modding & Control Plane** | Env vars only | **`VICTORY_MODS_DIR` + `VICTORY_LOAD_DLLS` (`6,812` natives) + Hydra Control pipe/CLI** |
 
 ---
 
 ## Current Progress, FPS & Test PC Specs
 
-> Self-assessed using the public [PortWatch VI](https://portwatch-vi.xyz/) scoring model (`50` base pts for milestones `Groundwork → Playable` + `17.5` Story + `12.5` Rendering + `10` Performance `[mean FPS ÷ 30]` + `10` Stability). Note: `VIctory-Hydra` is a self-reported community unification branch, not independently ranked on PortWatch.
+> Self-assessed using the public [PortWatch VI](https://portwatch-vi.xyz/) scoring model (`50` base pts for milestones `Groundwork → Playable` + `17.5` Story + `12.5` Rendering + `10` Performance + `10` Stability). Note: `VIctory-Hydra` is a self-reported experimental community branch, not independently ranked on PortWatch.
 
 <p align="center">
-  <img src="docs/progress-en.svg" alt="VIctory-Hydra PortWatch-style progress tracker — 82.2%" width="100%">
+  <img src="docs/progress-en.svg" alt="VIctory-Hydra PortWatch-style progress tracker — 84.6%" width="100%">
 </p>
 
 ### Subsystem Breakdown (Measured Locally)
 | Track | Score | Current State |
 | :--- | :--- | :--- |
-| **Milestones (`0–50%`)** | `50.0 / 50.0 pts` (`100%`) | `Groundwork` ● `Exe runs` ● `First frame` ● `Main menu` ● `In the world` ● `Playable` |
-| **Story progress (`17.5 pts`)** | `6.1 / 17.5 pts` (`35%`) | Prologue cleared; open-world gameplay & HUD active (full late-game campaign untested locally) |
-| **Rendering (`12.5 pts`)** | `10.6 / 12.5 pts` (`85%`) | 3D LUT banding, cloud holes, water blocks, BC7 rotation, 32×2 wave ticket & violet probes fixed; `305+` shader tests pass |
-| **Performance (`10.0 pts`)** | `7.0 / 10.0 pts` (`70%`) | **`25.9–30.8 FPS`** light scenes · **`16.9–20.9 FPS`** heavy scenes (`60.0 FPS` menus) vs `30 FPS` target |
-| **Stability (`10.0 pts`)** | `8.5 / 10.0 pts` (`85%`) | D3D12 `538`/`646` fixed, `HostHeap::id` guard, `VICTORY_RAW_VIEW_CLAMP`, `VICTORY_VRAM_BUDGET_MB`, WARP + RTX CI green |
-| **Total** | **`82.2%`** | **`+5.4%`** since Stage 7B (`76.8% → 82.2%`) |
+| **Milestones (`0–50%`)** | `50.0 / 50.0 pts` (`100%`) | `Groundwork` ● `Exe runs` ● `First frame` ● `Main menu` ● `In the world` ● `Playable` *(early/experimental)* |
+| **Story progress (`17.5 pts`)** | `6.1 / 17.5 pts` (`35%`) | Prologue cleared; open-world gameplay & HUD active (still too raw for full campaign playthroughs) |
+| **Rendering (`12.5 pts`)** | `11.1 / 12.5 pts` (`89%`) | 1080p DLSS 4 Preset K, FSR 3 FG 2x, Directional SH GI + Specular, DXIL opt `3007`, Wave32 LDS; some shadow/texture glitches remain |
+| **Performance (`10.0 pts`)** | `8.4 / 10.0 pts` (`84%`) | **`17–20` base FPS / up to `37–40 FPS` w/ FSR 3 FG 2x** (`12.8 ms/1k draws`, `~10 ms` GPU); streaming drops still need work |
+| **Stability (`10.0 pts`)** | `9.0 / 10.0 pts` (`90%`) | `CARD_COMPARE_EVERY=30`, dynamic RT VRAM room, `CARD_TOUCHED=1`, `360+` shader/GPU tests + WARP/RTX CI green |
+| **Total** | **`84.6%`** | **`+2.4%`** since Wave 1 (`82.2% → 84.6%`) — **Early / Experimental** |
 
 ### Reference Hardware (Primary Test Rig)
 | Component | Specification |

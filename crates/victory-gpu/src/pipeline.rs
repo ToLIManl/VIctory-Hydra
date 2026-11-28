@@ -202,6 +202,52 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// Root slots below 64 whose raw view the shader biases (a user-data
+    /// entry `USER_VIEW_BIAS`), bit per slot: for [`Translated::biased`].
+    pub(crate) bias_slots: u64,
+    /// Root slots below 64 it reads a constant buffer through as a root
+    /// descriptor, bit per slot: for [`Translated::from_cbv`].
+    pub(crate) cbv_slots: u64,
+}
+
+#[cfg(windows)]
+impl Translated {
+    /// Whether the shader adds the bytes the raw view in root slot `slot`
+    /// begins early by.
+    #[inline]
+    pub(crate) fn biased(&self, slot: u8) -> bool {
+        if slot < 64 {
+            return self.bias_slots >> slot & 1 != 0;
+        }
+        self.host.user_data.iter().any(|u| u.slot == slot && u.root == bias_root())
+    }
+
+    /// Whether the root view in slot `slot` is a constant buffer the shader
+    /// reads as a root descriptor.
+    #[inline]
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn from_cbv(&self, slot: u8) -> bool {
+        if slot < 64 {
+            return self.cbv_slots >> slot & 1 != 0;
+        }
+        self.used.iter().any(|u| is_root_cbv(u) && u.slot == slot)
+    }
+}
+
+#[cfg(windows)]
+fn bias_root() -> victory_shader::RootType {
+    victory_shader::RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
+}
+
+#[cfg(windows)]
+fn is_root_cbv(u: &victory_shader::UsedResource) -> bool {
+    u.root == victory_shader::RootType::Descriptor && u.kind == victory_shader::ResourceType::Cbv
+}
+
+/// The bits of `slots` below 64, one per slot.
+#[cfg(windows)]
+fn slot_bits(slots: impl Iterator<Item = u8>) -> u64 {
+    slots.filter(|&slot| slot < 64).fold(0, |bits, slot| bits | 1 << slot)
 }
 
 #[cfg(windows)]
@@ -284,6 +330,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     });
     let used = chosen.map(|p| p.used.to_vec()).unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let bias_slots = slot_bits(host.user_data.iter().filter(|u| u.root == bias_root()).map(|u| u.slot));
+    let cbv_slots = slot_bits(used.iter().filter(|u| is_root_cbv(u)).map(|u| u.slot));
     Ok(Translated {
         host,
         threads,
@@ -292,6 +340,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
+        bias_slots,
+        cbv_slots,
     })
 }
 
@@ -502,7 +552,9 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // (A load first: a swap writes the line on every bind of a pipeline
+    // bound long ago, from all recording threads.)
+    if p.bound.load(std::sync::atomic::Ordering::Relaxed) || p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();

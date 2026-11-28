@@ -90,6 +90,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -111,6 +112,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -305,21 +307,55 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: the default base passes (`63`) plus safe fast-math `FAST` (`128`) = `191`.
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one),
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked),
+///   128 safe LLVM fast-math flags (`FAST`, on by default),
+///   256 extended algebraic/bitwise/shift/compare/select folds and canonical
+///   comparison reuse/facts (`EXT_FOLD`, opt-in),
+///   512 alias-aware private-global forwarding, shared-memory load reuse, and
+///   overwritten-store elimination (`MEM_FWD`, opt-in),
+///   1024 pure loop-invariant code motion for guaranteed loop blocks and
+///   in-bounds constant-table loads (`LICM`, opt-in),
+///   2048 adjacent and read-after-read redundant barrier elimination (`BARRIERS`, opt-in),
+///   4096 speculative loop-invariant hoisting out of conditional loop blocks
+///   (`SPEC_LICM`, opt-in; `8191` is every bit including `WIDE` and `FAST`).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.with(std::cell::Cell::get) {
+        return passes & bitcode::opt::KNOWN;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread
+/// (tests only; restores the previous override on unwind).
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_SHADER_OPT.with(|c| c.replace(Some(passes)));
+    let _guard = Reset(prev);
+    f()
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -412,7 +448,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::KNOWN)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -501,13 +537,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs from the
+/// program as the title has it: on a host of 32-lane waves the water light's tile lists take
+/// a slot a lane ([`water_tile_slots`]). [`translate`] does this itself; a caller that parses
+/// the container and calls [`emit`] calls this first. Returns whether the program changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -519,6 +566,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // The water light's tile lists on a host of 32-lane waves: a slot a lane
+    // ([`water_tile_slots`]), so no tile is lost between the two host waves of a group.
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -1534,18 +1584,29 @@ mod tests {
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
-        let (all, usual, fast) = (
+        let (all, known, usual, fast) = (
             super::bitcode::opt::ALL,
+            super::bitcode::opt::KNOWN,
             super::bitcode::opt::DEFAULT,
             super::bitcode::opt::FAST,
         );
         assert_eq!(usual, 63 | fast, "the passes before wide loads, plus safe fast-math");
+        assert_eq!(all, 8063, "every pass excluding FAST");
+        assert_eq!(known, 8191, "every pass including FAST");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("127")), 127);
+        assert_eq!(parse_shader_opt(Some("128")), fast);
+        assert_eq!(parse_shader_opt(Some("256")), super::bitcode::opt::EXT_FOLD);
+        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::MEM_FWD);
+        assert_eq!(parse_shader_opt(Some("1024")), super::bitcode::opt::LICM);
+        assert_eq!(parse_shader_opt(Some("2048")), super::bitcode::opt::BARRIERS);
+        assert_eq!(parse_shader_opt(Some("4096")), super::bitcode::opt::SPEC_LICM);
+        assert_eq!(parse_shader_opt(Some("959")), usual | super::bitcode::opt::EXT_FOLD | super::bitcode::opt::MEM_FWD);
+        assert_eq!(parse_shader_opt(Some("3007")), usual | super::bitcode::opt::EXT_FOLD | super::bitcode::opt::MEM_FWD | super::bitcode::opt::BARRIERS);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), known);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 

@@ -588,6 +588,51 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty() || self.render_xor.is_some()
     }
 
+    /// Packed bit-positions for GPU compute detiling of thin 2D non-XOR tiled
+    /// layouts (`element_bytes` in `4 | 8 | 16`, `samples == 1`).
+    /// Returns `Some((x_bits, x_count, y_bits, y_count))` where nibble `i`
+    /// (`(bits >> (i * 4)) & 0xf`) is the byte-address bit position of
+    /// coordinate bit `i`, matching [`Layout::detile`] bit-for-bit.
+    pub fn gpu_detile_bits(&self) -> Option<(u32, u32, u32, u32)> {
+        if self.desc.dimension != Dimension::Tex2d
+            || self.thick
+            || self.desc.samples != 1
+            || !matches!(self.desc.element_bytes, 4 | 8 | 16)
+            || self.desc.swizzle == Swizzle::LINEAR
+            || self.desc.swizzle.xor()
+            || self.render_xor.is_some()
+            || !self.addressable()
+        {
+            return None;
+        }
+        let block_log2 = self.desc.swizzle.block_log2()?;
+        if block_log2 > 16 {
+            return None;
+        }
+        let element_log2 = self.desc.element_bytes.trailing_zeros();
+        let kind = usize::from(self.desc.swizzle.display());
+        let axes = pattern(kind, element_log2, block_log2);
+        if axes[0].len() > 8 || axes[1].len() > 8 {
+            return None;
+        }
+        let pack = |bits: &[u32]| -> Option<u32> {
+            let mut packed = 0u32;
+            for (i, &b) in bits.iter().enumerate() {
+                if b >= 16 {
+                    return None;
+                }
+                packed |= b << (i * 4);
+            }
+            Some(packed)
+        };
+        Some((
+            pack(&axes[0])?,
+            axes[0].len() as u32,
+            pack(&axes[1])?,
+            axes[1].len() as u32,
+        ))
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {

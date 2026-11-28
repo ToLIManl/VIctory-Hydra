@@ -23,6 +23,8 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
+pub mod mods;
+
 /// The host's own function: what the import would have been bound to.
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{
@@ -143,8 +145,8 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
 }
 
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive.
-pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+/// a virtual drive. When `read_only` is true, checks `VICTORY_MODS_DIR` first.
+pub(crate) fn translate_with_intent(path: &[u16], read_only: bool) -> Option<Vec<u16>> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
         None => (&[][..], path),
@@ -160,6 +162,9 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
+    if read_only && let Some(over) = mods::lookup(letter, tail) {
+        return Some(over);
+    }
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
@@ -183,6 +188,12 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     Some(out)
 }
 
+/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
+/// a virtual drive.
+pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+    translate_with_intent(path, false)
+}
+
 /// A title's wide path: the host path when it is on a virtual drive, else
 /// the title's own pointer.
 struct Wide(*const u16, Option<Vec<u16>>);
@@ -193,7 +204,7 @@ impl Wide {
     }
 }
 
-fn wide(path: *const u16) -> Wide {
+fn wide_with_intent(path: *const u16, read_only: bool) -> Wide {
     if path.is_null() {
         return Wide(path, None);
     }
@@ -202,9 +213,13 @@ fn wide(path: *const u16) -> Wide {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
-    let host = translate(path_slice);
+    let host = translate_with_intent(path_slice, read_only);
     trace(path_slice, host.as_deref());
     Wide(path, host)
+}
+
+fn wide(path: *const u16) -> Wide {
+    wide_with_intent(path, false)
 }
 
 /// Every title path at debug level, with the host path if rewritten.
@@ -218,7 +233,7 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
 
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
-fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+fn narrow_with_intent(path: *const c_char, read_only: bool) -> Option<Vec<u16>> {
     if path.is_null() {
         return None;
     }
@@ -240,9 +255,65 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
         MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
         wide
     };
-    let host = translate(&wide);
+    let host = translate_with_intent(&wide, read_only);
     trace(&wide, host.as_deref());
     host
+}
+
+fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+    narrow_with_intent(path, false)
+}
+
+fn create_is_read_only(access: u32, disposition: u32) -> bool {
+    const OPEN_EXISTING: u32 = 3;
+    // GENERIC_WRITE | GENERIC_ALL | DELETE | WRITE_DAC | WRITE_OWNER |
+    // FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES
+    const WRITE_MASK: u32 = 0x5000_0000 | 0x000D_0000 | 0x0000_0116;
+    disposition == OPEN_EXISTING && (access & WRITE_MASK) == 0
+}
+
+fn crt_mode_is_read_only_w(mode: *const u16) -> bool {
+    if mode.is_null() {
+        return false;
+    }
+    // SAFETY: NUL-terminated CRT mode string.
+    let mut saw_r = false;
+    let mut i = 0usize;
+    loop {
+        let ch = unsafe { *mode.add(i) };
+        if ch == 0 {
+            break;
+        }
+        match ch as u8 as char {
+            'w' | 'W' | 'a' | 'A' | '+' => return false,
+            'r' | 'R' => saw_r = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    saw_r
+}
+
+fn crt_mode_is_read_only_a(mode: *const c_char) -> bool {
+    if mode.is_null() {
+        return false;
+    }
+    // SAFETY: NUL-terminated CRT mode string.
+    let bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
+    let mut saw_r = false;
+    for &b in bytes {
+        match b {
+            b'w' | b'W' | b'a' | b'A' | b'+' => return false,
+            b'r' | b'R' => saw_r = true,
+            _ => {}
+        }
+    }
+    saw_r
+}
+
+fn open_flags_is_read_only(flags: i32) -> bool {
+    // Windows CRT: _O_RDONLY=0, _O_WRONLY=1, _O_RDWR=2, _O_APPEND=8, _O_CREAT=0x100, _O_TRUNC=0x200
+    (flags & 0x30B) == 0
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
@@ -269,7 +340,7 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let p = wide(path);
+    let p = wide_with_intent(path, create_is_read_only(access, disposition));
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -290,7 +361,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
+    match narrow_with_intent(path, create_is_read_only(access, disposition)) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
@@ -324,7 +395,7 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let p = wide(path);
+    let p = wide_with_intent(path, create_is_read_only(access, disposition));
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
@@ -364,7 +435,7 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
-    match narrow(path) {
+    match narrow_with_intent(path, true) {
         Some(p) => {
             host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
                 p.as_ptr(),
@@ -391,7 +462,7 @@ pub extern "system" fn GetFileAttributesExW(
     level: i32,
     info: *mut c_void,
 ) -> i32 {
-    let p = wide(path);
+    let p = wide_with_intent(path, true);
     host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
         level,
@@ -400,7 +471,7 @@ pub extern "system" fn GetFileAttributesExW(
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
-    let p = wide(path);
+    let p = wide_with_intent(path, true);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
 
@@ -499,12 +570,12 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
-    let p = wide(path);
+    let p = wide_with_intent(path, crt_mode_is_read_only_w(mode));
     host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
-    let p = wide(path);
+    let p = wide_with_intent(path, crt_mode_is_read_only_w(mode));
     host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
@@ -513,7 +584,7 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
-    let p = wide(path);
+    let p = wide_with_intent(path, crt_mode_is_read_only_w(mode));
     host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
@@ -577,7 +648,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
-    match narrow(path) {
+    match narrow_with_intent(path, crt_mode_is_read_only_a(mode)) {
         Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
             p.as_ptr(),
             widen(mode).as_ptr(),
@@ -591,7 +662,7 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
-    match narrow(path) {
+    match narrow_with_intent(path, crt_mode_is_read_only_a(mode)) {
         Some(p) => {
             host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
                 out,
@@ -610,7 +681,7 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
-    match narrow(path) {
+    match narrow_with_intent(path, open_flags_is_read_only(flags)) {
         Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
             p.as_ptr(),
             flags,
@@ -624,7 +695,7 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
-    let p = wide(path);
+    let p = wide_with_intent(path, open_flags_is_read_only(flags));
     host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
         flags,
@@ -633,12 +704,12 @@ pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
-    let p = wide(path);
+    let p = wide_with_intent(path, true);
     host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
 }
 
 pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
-    match narrow(path) {
+    match narrow_with_intent(path, true) {
         Some(p) => {
             host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
                 p.as_ptr(),

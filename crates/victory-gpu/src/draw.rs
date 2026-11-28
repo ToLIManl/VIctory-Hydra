@@ -568,6 +568,103 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// The vertex and index buffers given to the host list, and the
+    /// refreshes deferred for them ([`State::prepare_for`]).
+    ia: IaCache,
+    /// Whether a stage of the pipeline the last [`State::bind`] bound can
+    /// store to buffers (for [`State::drew`]).
+    bound_stores: bool,
+    /// [`State::memory_ready`]'s lists, kept from draw to draw.
+    memory_scratch: MemoryScratch,
+}
+
+/// What [`State::prepare_for`] gave the host list last.
+#[derive(Default)]
+struct IaCache {
+    /// The list epoch and refresh generation the refreshes below were
+    /// deferred under ([`HostList::epoch`], [`HostList::refresh_gen`]): while
+    /// both are unchanged, a range refreshed then is still in the list's
+    /// `refreshed` set, and [`HostList::defer_refresh`] would do nothing.
+    /// (Epochs are numbered across all lists, and a list reset takes a new
+    /// one.)
+    epoch: u64,
+    generation: u64,
+    /// [`crate::shadow::buffers_changed`] then: while it is unchanged too,
+    /// `shadow::find_any` would answer as it did (its own thread cache
+    /// trusts the same count), and the list holds the copy it gave (its
+    /// refresh step), so the host view found then is used as it is.
+    buffers: u64,
+    /// Per vertex slot, then of the index buffer: what was refreshed.
+    vertex_refreshed: [Refreshed; 32],
+    index_refreshed: Refreshed,
+    /// The host vertex views of slots `..vertex_set` the list has.
+    vertex: [D3D12_VERTEX_BUFFER_VIEW; 32],
+    vertex_set: usize,
+    /// The host index view the list has, if known.
+    index: Option<D3D12_INDEX_BUFFER_VIEW>,
+}
+
+/// A title buffer range refreshed for a draw: its address and bytes, the
+/// host copy (its `Arc` address; 0 for none) and the host view's address
+/// and bytes.
+#[derive(Default, Clone, Copy)]
+struct Refreshed {
+    address: u64,
+    size: u32,
+    copy: usize,
+    gpu: u64,
+    bytes: u32,
+}
+
+impl Refreshed {
+    /// What was found for title range `address`+`size`, if it was.
+    fn of(&self, address: u64, size: u32) -> Option<(u64, u32)> {
+        (self.copy != 0 && self.address == address && self.size == size).then_some((self.gpu, self.bytes))
+    }
+}
+
+impl IaCache {
+    /// Whether the refreshes remembered are still deferred in `list` as
+    /// they were, with no change to the buffer map; if not, they are
+    /// forgotten and the numbers of now taken.
+    fn refreshes_hold(&mut self, list: &HostList) -> bool {
+        // (The map's count first: a change during the lookups that follow
+        // shows at the next draw.)
+        let buffers = crate::shadow::buffers_changed();
+        let (epoch, generation) = (list.epoch(), list.refresh_gen());
+        if (self.epoch, self.generation, self.buffers) == (epoch, generation, buffers) {
+            return true;
+        }
+        self.epoch = epoch;
+        self.generation = generation;
+        self.buffers = buffers;
+        self.vertex_refreshed = [Refreshed::default(); 32];
+        self.index_refreshed = Refreshed::default();
+        false
+    }
+
+    /// The host list was replaced or recorded into by others: nothing is
+    /// known of its vertex and index buffers.
+    fn host_unknown(&mut self) {
+        self.vertex_set = 0;
+        self.index = None;
+    }
+}
+
+fn same_vertex_view(a: &D3D12_VERTEX_BUFFER_VIEW, b: &D3D12_VERTEX_BUFFER_VIEW) -> bool {
+    a.BufferLocation == b.BufferLocation && a.SizeInBytes == b.SizeInBytes && a.StrideInBytes == b.StrideInBytes
+}
+
+fn same_index_view(a: &D3D12_INDEX_BUFFER_VIEW, b: &D3D12_INDEX_BUFFER_VIEW) -> bool {
+    a.BufferLocation == b.BufferLocation && a.SizeInBytes == b.SizeInBytes && a.Format == b.Format
+}
+
+/// [`State::memory_ready`]'s lists: addresses, constants, written addresses.
+#[derive(Default)]
+struct MemoryScratch {
+    addresses: Vec<u64>,
+    constants: Vec<u32>,
+    written: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -837,9 +934,54 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
-/// Draws run on the host so far.
+/// Draws run on the host so far (up to [`COUNT_BATCH`] - 1 a thread behind
+/// until the thread closes a list, [`flush_counts`]).
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Counts go into [`DRAWN`] and [`DROPPED`] this many at a time from each
+/// recording thread: one shared line written per draw, from four threads
+/// and more, cost more than the count.
+const COUNT_BATCH: u64 = 256;
+
+thread_local! {
+    /// This thread's draws recorded and dropped, not yet in the totals.
+    static COUNTS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+#[inline]
+fn count(which: usize) {
+    COUNTS.with(|counts| {
+        let mut c = counts.get();
+        c[which] += 1;
+        if c[which] >= COUNT_BATCH {
+            [&DRAWN, &DROPPED][which].fetch_add(c[which], Ordering::Relaxed);
+            c[which] = 0;
+        }
+        counts.set(c);
+    });
+}
+
+#[inline]
+fn count_drawn() {
+    count(0);
+}
+
+#[inline]
+fn count_dropped() {
+    count(1);
+}
+
+/// Puts this thread's counts into the totals (at the end of a list).
+pub(crate) fn flush_counts() {
+    let c = COUNTS.with(|counts| counts.replace([0; 2]));
+    if c[0] != 0 {
+        DRAWN.fetch_add(c[0], Ordering::Relaxed);
+    }
+    if c[1] != 0 {
+        DROPPED.fetch_add(c[1], Ordering::Relaxed);
+    }
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -1336,6 +1478,7 @@ impl State {
     pub(crate) fn after_external(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
+        self.ia.host_unknown();
         self.root_bindings.iter_mut().for_each(RootBindings::clear);
         self.host_heaps = [usize::MAX; 2];
         self.host_heaps_set = false;
@@ -1579,6 +1722,8 @@ impl State {
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
+        // (Another host list: its refreshes are its own, by its epoch.)
+        self.ia.host_unknown();
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
         if self.topology_set {
@@ -1715,7 +1860,7 @@ impl State {
     /// the views whose addresses it takes (`t`: the ray-tracing structures
     /// it walks).
     fn memory_ready(
-        &self,
+        &mut self,
         list: &HostList,
         t: &crate::pipeline::Translated,
         compute: bool,
@@ -1725,17 +1870,38 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        // (The lists are the state's, kept from draw to draw.)
+        let mut scratch = std::mem::take(&mut self.memory_scratch);
+        let ready = self.memory_ready_into(list, heap, t, compute, use_, &mut scratch);
+        self.memory_scratch = scratch;
+        ready
+    }
+
+    /// [`State::memory_ready`] with its lists of addresses, constants and
+    /// written addresses in `scratch`.
+    fn memory_ready_into(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::host::HostHeap,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        use_: crate::memory::Use,
+        scratch: &mut MemoryScratch,
+    ) -> Option<crate::memory::Ready> {
+        let MemoryScratch { addresses, constants, written } = scratch;
+        addresses.clear();
+        constants.clear();
+        written.clear();
         // (What it may write: its root views of unordered access.)
-        let written: Vec<u64> = t
-            .used
-            .iter()
-            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Descriptor)
-            .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
-                Some(&Root::View(address)) => Some(address),
-                _ => None,
-            })
-            .collect();
+        written.extend(
+            t.used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Descriptor)
+                .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => None,
+                }),
+        );
         for root in self.roots_ref(compute) {
             match root {
                 // (Of a program that only walks structures, the structures'
@@ -1750,7 +1916,7 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        crate::memory::ready(list, heap, addresses, written, constants, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.
@@ -1789,6 +1955,12 @@ impl State {
             return false;
         }
         let l = &list.list;
+        // Draw after draw binds the same buffers: while the list's epoch,
+        // its refresh generation and the buffer map are unchanged, a range
+        // refreshed in this list is neither looked up nor refreshed again
+        // (`defer_refresh` would find it done, after its lock and hash), and
+        // views the host list has already are not set again.
+        let hold = (p.slots != 0 || indexed) && self.ia.refreshes_hold(list);
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -1800,35 +1972,75 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                continue;
+            let (gpu, bytes) = match self.ia.vertex_refreshed[slot].of(v.address, v.size).filter(|_| hold) {
+                Some(found) => found,
+                None => {
+                    let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                        continue;
+                    };
+                    shadow.refresh(list, v.address, u64::from(v.size));
+                    let found = (
+                        shadow.gpu(v.address),
+                        v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                    );
+                    self.ia.vertex_refreshed[slot] = Refreshed {
+                        address: v.address,
+                        size: v.size,
+                        copy: std::sync::Arc::as_ptr(&shadow) as usize,
+                        gpu: found.0,
+                        bytes: found.1,
+                    };
+                    found
+                }
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                BufferLocation: gpu,
+                SizeInBytes: bytes,
                 StrideInBytes: v.stride,
             };
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
+        let ia = &mut self.ia;
+        if count > 0
+            && !(ia.vertex_set >= count && views[..count].iter().zip(&ia.vertex).all(|(a, b)| same_vertex_view(a, b)))
+        {
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
+            ia.vertex[..count].copy_from_slice(&views[..count]);
+            ia.vertex_set = ia.vertex_set.max(count);
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+            let (gpu, bytes) = match self.ia.index_refreshed.of(v.address, v.size).filter(|_| hold) {
+                Some(found) => found,
+                None => {
+                    let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                        return false;
+                    };
+                    shadow.refresh(list, v.address, u64::from(v.size));
+                    let found = (
+                        shadow.gpu(v.address),
+                        v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                    );
+                    self.ia.index_refreshed = Refreshed {
+                        address: v.address,
+                        size: v.size,
+                        copy: std::sync::Arc::as_ptr(&shadow) as usize,
+                        gpu: found.0,
+                        bytes: found.1,
+                    };
+                    found
+                }
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                BufferLocation: gpu,
+                SizeInBytes: bytes,
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if !self.ia.index.as_ref().is_some_and(|bound| same_index_view(bound, &view)) {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+                self.ia.index = Some(view);
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1956,8 +2168,11 @@ impl State {
         } else {
             Few::default()
         };
+        // (Complete once the loop is: a bind that returns early runs nothing.)
+        self.bound_stores = false;
         for stage in &p.stages {
             let t = stage.translated();
+            self.bound_stores |= t.stores;
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
@@ -2085,16 +2300,10 @@ impl State {
                         continue;
                     };
                     // The shader adds the bytes a raw view begins early by.
-                    let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
-                        });
+                    let biased = srv && t.biased(slot);
                     if tabled {
                         // A root constant buffer, read as a root SRV (renderer port 5).
-                        let from_cbv = t.used.iter().any(|u| {
-                            u.root == RootType::Descriptor && u.slot == slot && u.kind == ResourceType::Cbv
-                        });
+                        let from_cbv = t.from_cbv(slot);
                         if !self.root_srv_table(list, Some(address), param, compute, biased, from_cbv) {
                             return false;
                         }
@@ -3436,17 +3645,23 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let prof = prof_begin();
+        self.dispatch_unprofiled(list, x, y, z, flags);
+        self.prof_end(prof, true);
+    }
+
+    fn dispatch_unprofiled(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3459,7 +3674,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3472,7 +3687,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -4056,15 +4271,15 @@ impl State {
                         // SAFETY: an open list with everything set.
                         None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
                     }
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew_bound();
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    count_drawn();
                     true
                 }
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4608,6 +4823,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let prof = prof_begin();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4619,6 +4835,10 @@ impl State {
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        if ready && rects {
+            // (It set vertex buffers of its own.)
+            self.ia.host_unknown();
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -4633,14 +4853,15 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew_bound();
+            count_drawn();
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.prof_end(prof, false);
     }
 
     /// With frame generation (`crate::streamline`), before a draw into one
@@ -4741,6 +4962,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let prof = prof_begin();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4762,15 +4984,54 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drew_bound();
+            count_drawn();
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.prof_end(prof, false);
     }
+
+    /// `crate::prof`: counts the draw or dispatch just recorded under the
+    /// shader of its pipeline's last stage (pixel or compute), timed if
+    /// [`prof_begin`] started a clock.
+    #[cold]
+    fn prof_record(&self, started: Option<std::time::Instant>, compute: bool) {
+        let hash = crate::pipeline::host_pipeline(self.pipeline as This)
+            .and_then(|p| p.stages.last())
+            .and_then(|stage| u64::from_str_radix(&stage.shader.hash, 16).ok())
+            .unwrap_or(0);
+        let ns = started.map(|t| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        crate::prof::record_shader(hash, compute, ns);
+    }
+
+    #[inline]
+    fn prof_end(&self, prof: Option<Option<std::time::Instant>>, compute: bool) {
+        if let Some(started) = prof {
+            self.prof_record(started, compute);
+        }
+    }
+}
+
+/// With `crate::prof` on: `Some`, holding a clock started for 1 call in
+/// `SAMPLE_MASK + 1` on this thread. Off it is one relaxed load.
+#[inline]
+fn prof_begin() -> Option<Option<std::time::Instant>> {
+    if !crate::prof::on() {
+        return None;
+    }
+    thread_local! {
+        static CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let n = CALLS.with(|calls| {
+        let n = calls.get();
+        calls.set(n.wrapping_add(1));
+        n
+    });
+    Some((n & crate::prof::SAMPLE_MASK == 0).then(std::time::Instant::now))
 }
 
 impl State {
@@ -4787,6 +5048,14 @@ impl State {
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            self.batch = None;
+        }
+    }
+
+    /// [`State::drew`] for a draw of the pipeline [`State::bind`] just bound
+    /// in full (what its stages store was noted there).
+    fn drew_bound(&mut self) {
+        if self.bound_stores {
             self.batch = None;
         }
     }
@@ -4962,7 +5231,7 @@ impl State {
                 return false;
             }
             self.drew(Some(p));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            count_drawn();
             return true;
         }
         // Renderer port 1: arguments (or their count) in title memory read
@@ -5141,7 +5410,7 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            count_drawn();
         }
         true
     }
@@ -5369,8 +5638,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_copy(*resource as This)
+            // The host copy, asked for once (each ask takes the resource's
+            // lock and a reference) for the upload and the state below.
+            let copy = if aliased { None } else { crate::resource::host_copy(*resource as This) };
+            if let Some(t) = &copy
                 && t.flags() & 0x7 == 0
             {
                 // (A texture the title writes: no target, depth or unordered
@@ -5380,7 +5651,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
-                crate::texture::upload_from(list, *resource as This, first);
+                crate::texture::upload_from_copy(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -5393,7 +5664,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            // (An aliased texture's copy is asked for here, after its twin,
+            // as before.)
+            if let Some(copy) = copy.or_else(|| crate::resource::host_copy(*resource as This)) {
+                crate::list::ensure_copy_state(list, &copy, state);
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)

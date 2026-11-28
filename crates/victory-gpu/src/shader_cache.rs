@@ -112,7 +112,7 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
-        // Opt-in shader translation switches (Stage 10 Wave 2/3): folded into
+        // Opt-in shader translation switches (Stage 10 Wave 2/3/9): folded into
         // the key only when enabled so existing default caches stay valid.
         for name in [
             "VICTORY_WAVE64_PAIRED",
@@ -122,6 +122,8 @@ fn build() -> [u8; 32] {
             "VICTORY_RESINFO_MSAA",
             "VICTORY_RESINFO_D16",
             "VICTORY_COMPUTE_WINDOW_COHERENCE",
+            "VICTORY_LDS_ANALYZE",
+            "VICTORY_LDS_WRITE_ONLY_OK",
         ] {
             if std::env::var_os(name).is_some_and(|v| v == "1") {
                 bytes.extend_from_slice(name.as_bytes());

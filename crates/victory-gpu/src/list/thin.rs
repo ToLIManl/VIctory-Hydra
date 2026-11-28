@@ -771,6 +771,44 @@ fn is_state_op(op: u64) -> bool {
     )
 }
 
+/// Whether `op` runs in a run of state calls ([`translate`]): a state call or
+/// a plain draw (which only records on the host list the run holds).
+#[inline]
+fn is_fused(op: u64) -> bool {
+    is_state_op(op) || op == Plain::DRAW as u64 || op == Plain::DRAW_INDEXED as u64
+}
+
+/// Runs one call of a run ([`is_fused`]): a draw as `state::draw` and
+/// `state::draw_indexed` do, else a state call.
+#[inline]
+fn run_fused(op: u64, w: &[u64], host: &crate::host::HostList, s: &mut crate::draw::State) {
+    // (As `run_plain` reads arguments.)
+    let arg = |k: usize| w.get(k).copied().unwrap_or(0);
+    if op == Plain::DRAW as u64 {
+        super::count_draw();
+        s.draw(host, Word::unword(arg(0)), Word::unword(arg(1)), Word::unword(arg(2)), Word::unword(arg(3)));
+        return;
+    }
+    if op == Plain::DRAW_INDEXED as u64 {
+        super::count_draw();
+        s.draw_indexed(
+            host,
+            Word::unword(arg(0)),
+            Word::unword(arg(1)),
+            Word::unword(arg(2)),
+            <i32 as Word>::unword(arg(3)),
+            Word::unword(arg(4)),
+        );
+        return;
+    }
+    if op == Plain::SET_PIPELINE as u64
+        && let Some(&p) = w.first()
+    {
+        crate::pipeline::bound(Word::unword(p));
+    }
+    run_state_op(op, w, host, s);
+}
+
 #[inline]
 fn slice_at<T>(w: &[u64], from: usize, count: usize) -> &[T] {
     let ptr: *const T = at(w, from, count);
@@ -895,29 +933,26 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if is_state_op(op) {
-            if op == Plain::SET_PIPELINE as u64
-                && let Some(&p) = w.first()
-            {
-                crate::pipeline::bound(Word::unword(p));
-            }
-            let mut scan = i;
-            while scan < stream.len() {
-                let next_op = stream[scan] & 0xffff;
-                if !is_state_op(next_op) {
-                    break;
+        if is_fused(op) {
+            if super::host_list(list).is_none() {
+                // Nothing records: a draw is counted, a pipeline noted.
+                if op == Plain::DRAW as u64 || op == Plain::DRAW_INDEXED as u64 {
+                    super::count_draw();
+                } else if op == Plain::SET_PIPELINE as u64
+                    && let Some(&p) = w.first()
+                {
+                    crate::pipeline::bound(Word::unword(p));
                 }
-                let next_len = (stream[scan] >> 16) as usize;
-                if next_op == Plain::SET_PIPELINE as u64 && next_len > 0 {
-                    crate::pipeline::bound(Word::unword(stream[scan + 1]));
-                }
-                scan += 1 + next_len;
+                continue;
             }
+            // A run of state calls and plain draws under one lock of the
+            // list's state (a draw alone took the lock and looked the host
+            // list up again).
             super::with_state(list, |host, state| {
-                run_state_op(op, w, host, state);
+                run_fused(op, w, host, state);
                 while i < stream.len() {
                     let next_op = stream[i] & 0xffff;
-                    if !is_state_op(next_op) {
+                    if !is_fused(next_op) {
                         break;
                     }
                     if (calls + 1) % 64 == 0 {
@@ -930,7 +965,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     let next_w = &stream[i + 1..i + 1 + next_len];
                     i += 1 + next_len;
                     calls += 1;
-                    run_state_op(next_op, next_w, host, state);
+                    run_fused(next_op, next_w, host, state);
                 }
             });
             continue;
@@ -989,6 +1024,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             _ => {}
         }
     }
+    super::flush_counts();
     (calls, closed)
 }
 

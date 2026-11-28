@@ -173,6 +173,43 @@ const ITEMS: &[Item] = &[
         live: true,
     },
     Item {
+        var: "VICTORY_GPU_DETILE",
+        label: "GPU TEXTURE DETILE",
+        values: OFF_ON,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_PIX",
+        label: "PIX/NSIGHT MARKERS",
+        values: OFF_ON,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_PROF",
+        label: "PASS/SHADER PROFILER",
+        values: OFF_ON,
+        live: true,
+    },
+    Item {
+        var: "VICTORY_LOW_SHADOWS",
+        label: "RAGE9 SHADOW MAPS",
+        values: &[
+            ("0", "STOCK (CONSOLE)"),
+            ("1", "LOW 1280PX"),
+            ("2", "ULTRA-LOW 1024PX"),
+        ],
+        live: false,
+    },
+    Item {
+        var: "VICTORY_LOW_VOLUMETRIC",
+        label: "RAGE9 VOLUMETRIC MAP",
+        values: &[
+            ("0", "STOCK (256PX/8M)"),
+            ("1", "LOW (128PX/7M)"),
+        ],
+        live: false,
+    },
+    Item {
         var: "VICTORY_MENU_DLSS",
         label: "DLSS SUPER RES",
         values: &[
@@ -210,8 +247,8 @@ const ITEMS: &[Item] = &[
         var: "VICTORY_WATER_LIGHT",
         label: "WATER LIGHT",
         values: &[
-            ("0", "OFF (FAST, NO BLOCKS)"),
-            ("1", "ON (SLOW, DARK BLOCKS)"),
+            ("0", "OFF (FAST)"),
+            ("1", "ON (WAVE32 FIXED)"),
         ],
         live: false,
     },
@@ -319,12 +356,30 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
         .position(|(v, _)| v.eq_ignore_ascii_case(value))
 }
 
+fn engine_status_tag(var: &str, value: &str) -> &'static str {
+    if value.is_empty() || value == "0" {
+        return "";
+    }
+    let status_var = match var {
+        "VICTORY_LOW_SHADOWS" => "VICTORY_ENGINE_STATUS_LOW_SHADOWS",
+        "VICTORY_LOW_VOLUMETRIC" => "VICTORY_ENGINE_STATUS_LOW_VOLUMETRIC",
+        _ => return "",
+    };
+    match std::env::var(status_var).as_deref() {
+        Ok("Done") => " (OK)",
+        Ok("Differs" | "Failed") => " (NOT APPLIED)",
+        _ => "",
+    }
+}
+
 fn shown_value(item: &Item, value: &str) -> String {
-    match index_of(item, value) {
+    let base = match index_of(item, value) {
         Some(i) => item.values[i].1.to_owned(),
         None if value.is_empty() => "DEFAULT".to_owned(),
         None => value.to_ascii_uppercase(),
-    }
+    };
+    let tag = engine_status_tag(item.var, value);
+    if tag.is_empty() { base } else { format!("{base}{tag}") }
 }
 
 fn keys() -> &'static Mutex<Vec<u16>> {
@@ -645,43 +700,7 @@ impl Menu {
                 std::env::set_var(var, value);
             }
         }
-        match var {
-            "VICTORY_AMBIENT" => crate::ambient::set_live(value),
-            "VICTORY_AMBIENT_SPECULAR" => crate::ambient::set_specular_live(value),
-            "VICTORY_AMBIENT_SPECULAR_ALPHA" => crate::ambient::set_specular_alpha_live(value == "1"),
-            "VICTORY_AMBIENT_ONCE" => crate::ambient::set_once_live(value == "1"),
-            "VICTORY_AMBIENT_AIR" => crate::ambient::set_air_live(value),
-            "VICTORY_AMBIENT_REFLECT" => crate::ambient::set_reflect_live(value),
-            "VICTORY_DLSS_PRESET" => crate::streamline::set_dlss_preset_live(value),
-            "VICTORY_MENU_FRAMEGEN" => {
-                crate::streamline::set_framegen(value.parse().unwrap_or(0));
-            }
-            "VICTORY_MENU_FPS" => {
-                let ms = match value.as_str() {
-                    "30" => 33.333,
-                    "60" => 16.667,
-                    "120" => 8.333,
-                    _ => 0.0,
-                };
-                crate::frame::set_interval_live(ms);
-            }
-            "VICTORY_FPS_LINE" => {
-                fps_line_on().store(value != "0", Ordering::Relaxed);
-            }
-            "VICTORY_PANEL" => {
-                super::panel::shown().store(value == "1", Ordering::Relaxed);
-            }
-            "VICTORY_ROOT_BIND_CACHE" => {
-                crate::draw::set_root_bind_cache_live(value == "1");
-            }
-            "VICTORY_WC_NO_BACK" => {
-                crate::shadow::set_wc_no_back_live(value == "1");
-            }
-            "VICTORY_TEXTURE_NO_WAIT" => {
-                crate::texture::set_no_wait_live(value == "1");
-            }
-            _ => {}
-        }
+        let _ = apply_live_var(var, value);
     }
 
     fn settings_path() -> Option<std::path::PathBuf> {
@@ -979,6 +998,83 @@ impl Notice {
         let at = (width.saturating_sub(w) / 2, 24 * scale);
         buffers.copy(&list.list, back, at, (w, h), (width, height));
     }
+}
+
+/// Applies one live-editable setting without calling `std::env::set_var`
+/// (safe for both the F1 menu and the Hydra Control pipe thread).
+/// Returns `Err("restart-only")` for startup-only `OnceLock` knobs and
+/// `Err("unknown-var")` for unrecognized variables.
+pub(crate) fn apply_live_var(var: &str, value: &str) -> Result<(), &'static str> {
+    match var {
+        "VICTORY_AMBIENT" => crate::ambient::set_live(value),
+        "VICTORY_AMBIENT_SPECULAR" => crate::ambient::set_specular_live(value),
+        "VICTORY_AMBIENT_SPECULAR_ALPHA" => {
+            crate::ambient::set_specular_alpha_live(value == "1")
+        }
+        "VICTORY_AMBIENT_ONCE" => crate::ambient::set_once_live(value == "1"),
+        "VICTORY_AMBIENT_AIR" => crate::ambient::set_air_live(value),
+        "VICTORY_AMBIENT_REFLECT" => crate::ambient::set_reflect_live(value),
+        "VICTORY_DLSS_PRESET" => crate::streamline::set_dlss_preset_live(value),
+        "VICTORY_MENU_FRAMEGEN" => {
+            crate::streamline::set_framegen(value.parse().unwrap_or(0));
+        }
+        "VICTORY_MENU_FPS" => {
+            let ms = match value {
+                "30" => 33.333,
+                "60" => 16.667,
+                "120" => 8.333,
+                _ => 0.0,
+            };
+            crate::frame::set_interval_live(ms);
+        }
+        "VICTORY_FPS_LINE" => {
+            fps_line_on().store(value != "0", Ordering::Relaxed);
+        }
+        "VICTORY_PANEL" => {
+            super::panel::shown().store(value == "1", Ordering::Relaxed);
+        }
+        "VICTORY_ROOT_BIND_CACHE" => {
+            crate::draw::set_root_bind_cache_live(value == "1");
+        }
+        "VICTORY_WC_NO_BACK" => {
+            crate::shadow::set_wc_no_back_live(value == "1");
+        }
+        "VICTORY_TEXTURE_NO_WAIT" => {
+            crate::texture::set_no_wait_live(value == "1");
+        }
+        "VICTORY_GPU_DETILE" => {
+            crate::detile::set_live(value == "1");
+        }
+        "VICTORY_PIX" => {
+            crate::pix::set_live(value == "1");
+        }
+        "VICTORY_PROF" => {
+            crate::prof::set_live(value == "1");
+        }
+        other => {
+            if ITEMS.iter().any(|item| item.var == other)
+                || matches!(
+                    other,
+                    "VICTORY_SHADER_OPT"
+                        | "VICTORY_LDS_ANALYZE"
+                        | "VICTORY_CARD_COMPARE_EVERY"
+                        | "VICTORY_PORT_CONSTANTS"
+                        | "VICTORY_CARD_TOUCHED"
+                        | "VICTORY_LOAD_DLLS"
+                        | "VICTORY_MODS_DIR"
+                )
+            {
+                return Err("restart-only");
+            }
+            return Err("unknown-var");
+        }
+    }
+    Ok(())
+}
+
+/// Lists all F1-tracked settings and whether each applies live without restart.
+pub(crate) fn list_vars() -> Vec<(&'static str, bool)> {
+    ITEMS.iter().map(|item| (item.var, live(item))).collect()
 }
 
 #[cfg(test)]

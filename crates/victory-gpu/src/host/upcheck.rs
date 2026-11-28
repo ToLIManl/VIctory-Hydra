@@ -942,6 +942,120 @@ mod tests {
         assert_eq!(host.log_messages(), None);
     }
 
+    /// The lean compare (`VICTORY_CARD_COMPARE_EVERY`, `lean::Lean`), end to
+    /// end, with the fetch on the copy queue: flights declare the whole copy
+    /// and each writes a byte of its own in a piece written once (cold: most
+    /// of their compares do not read it); right after, the title writes a
+    /// byte of its own in the same piece, which the next submission's
+    /// refresh sends up, hashing the piece again. Without the compares ahead
+    /// of those sends (`VICTORY_CARD_COMPARE_EVERY_AHEAD=0`) the hash takes
+    /// the flight's byte in and no later compare finds it: at the end every
+    /// flight's byte must be in title memory, every title byte its own, and
+    /// nothing differ between the card and the CPU's side.
+    ///
+    /// `patched`: the title's bytes are two runs of a page, a flight is kept
+    /// in the air, and `VICTORY_PATCH_PAGE_RUNS=1` has the merge send them as
+    /// a masked patch ([`crate::shadow::card_patches`]) and not as ranges
+    /// sent up: such a copy enters the sends with no changed range of its
+    /// own, and its patched piece is hashed again all the same.
+    fn cold_writes_beside_the_titles_bytes(patched: bool) {
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(super::super::lean_on(), "set VICTORY_CARD_COMPARE_EVERY=4 (with the relay)");
+        if patched {
+            assert!(
+                crate::shadow::masked_patch_mode() == 1 && crate::shadow::patch_lean_mode() == 1,
+                "set VICTORY_MASKED_PATCH=1 VICTORY_PATCH_LEAN=1 VICTORY_PATCH_PAGE_RUNS=1"
+            );
+        }
+        let first = host.new_list().unwrap();
+        first.close();
+        host.execute_own(&first);
+        settle_now(WHY_SYNC);
+        let (title, start, shadow) = title(if patched { 0x6667 } else { 0x6666 }, false);
+        let slow = patched.then(|| Slow::new(host));
+        let sent = |i: usize| crate::shadow::PATCHED[i].load(Ordering::Relaxed);
+        let patches_before = sent(3);
+        let mut lists = vec![first];
+        let mut flights: Vec<(usize, u8)> = Vec::new();
+        let mut own: Vec<(usize, u8)> = Vec::new();
+        const ROUNDS: usize = 40;
+        for round in 0..ROUNDS {
+            let piece = 8 + round;
+            let at = (piece << 16) + 64 + round * 8;
+            let value = round as u8 + 1;
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            shadow.gpu_writes(&list, start as u64, LEN as u64);
+            write(host, &list, &shadow, at, &[value]);
+            if let Some(slow) = &slow {
+                // The flight stays in the air while the title writes beside it.
+                slow.record(&list, 8);
+            }
+            list.close();
+            host.execute_own(&list);
+            flights.push((at, value));
+            lists.push(list);
+            // The title's own, in the same piece: up with the next refresh.
+            if patched {
+                // Two runs of one page, the bytes between unchanged, each
+                // longer than the runs that go up as pairs of words: more
+                // than `VICTORY_PATCH_PAGE_RUNS=1` copies of its own.
+                let base = (piece << 16) + 37_000 + round;
+                for (run, value) in [(base, 0xA0 + round as u8), (base + 400, 0xC0 + round as u8)] {
+                    title[run..run + 300].fill(value);
+                    own.extend([(run, value), (run + 299, value)]);
+                }
+            } else {
+                let mine = (piece << 16) + 40_000 + round;
+                title[mine] = 0xA0 + round as u8;
+                own.push((mine, 0xA0 + round as u8));
+            }
+            if round % 7 == 6 {
+                settle_now(WHY_SYNC);
+            }
+        }
+        // Submissions that write nothing, until every range was read whole again.
+        for _ in 0..6 {
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            shadow.gpu_writes(&list, start as u64, LEN as u64);
+            list.close();
+            host.execute_own(&list);
+            lists.push(list);
+        }
+        settle_now(WHY_SYNC);
+        let lost: Vec<usize> = flights.iter().filter(|&&(at, value)| title[at] != value).map(|&(at, _)| at >> 16).collect();
+        for &(at, value) in &own {
+            assert_eq!(title[at], value, "the title's byte at {at:#x} is its own");
+        }
+        let stats: Vec<u64> = lean::LEAN_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        eprintln!("pieces whose flight's byte is not in title memory: {lost:?}; lean statistics {stats:?}");
+        assert!(lost.is_empty(), "shaders' writes lost to the sends' hashes");
+        assert!(stats[lean::lean_stat::AHEAD] > 0 && stats[lean::lean_stat::AHEAD_FOUND] > 0, "pieces compared ahead of sends");
+        if patched {
+            assert!(sent(3) > patches_before, "the title's bytes went up as masked patches (else this checks nothing patched)");
+        }
+        assert_eq!(look(host), Some(0), "nothing differs at rest");
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_ALL=1 VICTORY_CARD_COMPARE_EVERY=4 VICTORY_UPCOPY_CHECK=1 and a process of its own"]
+    fn cold_writes_beside_the_titles_bytes_land_with_lean_compares() {
+        cold_writes_beside_the_titles_bytes(false);
+    }
+
+    /// As above with the title's bytes sent as a masked patch: the sync list
+    /// hashes the patched ranges again in mode 0 (`Host::card_before`), so
+    /// they must be compared ahead like the changed ranges are.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_ALL=1 VICTORY_CARD_COMPARE_EVERY=4 VICTORY_UPCOPY_CHECK=1 VICTORY_MASKED_PATCH=1 VICTORY_PATCH_LEAN=1 VICTORY_PATCH_PAGE_RUNS=1 and a process of its own"]
+    fn cold_writes_beside_a_masked_patch_land_with_lean_compares() {
+        cold_writes_beside_the_titles_bytes(true);
+    }
+
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {

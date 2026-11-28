@@ -242,6 +242,21 @@ fn apply_menu_settings() {
                 .is_some_and(|v| v > 0.0);
             std::env::set_var("VICTORY_AMBIENT_REFLECT", if spec_on { "0" } else { "0.5" });
         }
+        if std::env::var_os("VICTORY_GPU_DETILE").is_none() {
+            std::env::set_var("VICTORY_GPU_DETILE", "0");
+        }
+        if std::env::var_os("VICTORY_PIX").is_none() {
+            std::env::set_var("VICTORY_PIX", "0");
+        }
+        if std::env::var_os("VICTORY_PROF").is_none() {
+            std::env::set_var("VICTORY_PROF", "0");
+        }
+        if std::env::var_os("VICTORY_LOW_SHADOWS").is_none() {
+            std::env::set_var("VICTORY_LOW_SHADOWS", "0");
+        }
+        if std::env::var_os("VICTORY_LOW_VOLUMETRIC").is_none() {
+            std::env::set_var("VICTORY_LOW_VOLUMETRIC", "0");
+        }
     }
 }
 
@@ -453,12 +468,16 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it), plus verified RAGE 9 engine
+    // quality overrides (VICTORY_LOW_SHADOWS, VICTORY_LOW_VOLUMETRIC).
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe {
+            victory_loader::resolution::apply_asked(image.base(), size);
+            victory_loader::engine::apply_asked(image.base(), size);
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -480,6 +499,12 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // Start Hydra Control local named pipe (`\\.\pipe\victory_hydra`) before
+    // loading host DLLs so `hydra_bridge.asi` can immediately register its game plane.
+    victory_gpu::hydra::start(image.base(), image.info().size_of_image as usize);
+    // Host DLLs named in `VICTORY_LOAD_DLLS` are notified about the mapped
+    // title before any title code runs (port of modpapi/scripthook-vi).
+    load_host_dlls(image.base(), image.info().size_of_image as u64, exe);
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -487,6 +512,77 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// Exported C ABI registration hook for `hydra_bridge.asi` (linked via
+/// `/EXPORT:victory_hydra_register_game` in `apps/victory/build.rs`).
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn victory_hydra_register_game(
+    api: *const victory_gpu::hydra::HydraGameApi,
+) -> i32 {
+    // SAFETY: forwarded from C ABI caller (`hydra_bridge.asi`).
+    unsafe { victory_gpu::hydra::register_game_api(api) }
+}
+
+/// `VICTORY_LOAD_DLLS=<path>;<path>` loads each host DLL and calls its
+/// `victory_on_title_mapped(&TitleInfo)` export, if present. Failures are
+/// logged and skipped; the title runs on (port of modpapi/scripthook-vi).
+#[cfg(windows)]
+fn load_host_dlls(base: usize, size: u64, exe: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct TitleInfo {
+        struct_size: u32,
+        version: u32,
+        image_base: *mut core::ffi::c_void,
+        image_size: u64,
+        exe_path: *const u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            name: *const u8,
+        ) -> *mut core::ffi::c_void;
+    }
+    let Ok(list) = std::env::var("VICTORY_LOAD_DLLS") else {
+        return;
+    };
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
+    let exe_w: &'static [u16] = Vec::leak(wide(exe.as_os_str()));
+    for path in list.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let path_w = wide(std::ffi::OsStr::new(path));
+        // SAFETY: NUL-terminated path; the module stays loaded for the run.
+        let module = unsafe { LoadLibraryW(path_w.as_ptr()) };
+        if module.is_null() {
+            eprintln!(
+                "VIctory: host dll {path}: not loaded ({})",
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        // SAFETY: NUL-terminated name and a loaded module.
+        let entry = unsafe { GetProcAddress(module, c"victory_on_title_mapped".as_ptr().cast()) };
+        if entry.is_null() {
+            eprintln!("VIctory: host dll {path}: loaded, no victory_on_title_mapped export");
+            continue;
+        }
+        let info = TitleInfo {
+            struct_size: size_of::<TitleInfo>() as u32,
+            version: 1,
+            image_base: base as *mut _,
+            image_size: size,
+            exe_path: exe_w.as_ptr(),
+        };
+        // SAFETY: documented C-ABI export signature; `info` outlives the call.
+        let entry: unsafe extern "C" fn(*const TitleInfo) -> i32 =
+            unsafe { std::mem::transmute(entry) };
+        let rc = unsafe { entry(&info) };
+        eprintln!("VIctory: host dll {path}: victory_on_title_mapped returned {rc}");
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

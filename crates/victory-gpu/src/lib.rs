@@ -42,6 +42,8 @@ mod faultbook;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
+#[cfg(windows)]
+mod detile;
 pub mod device;
 #[cfg(windows)]
 mod draw;
@@ -52,6 +54,8 @@ pub mod frame;
 mod book;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+pub mod hydra;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -74,11 +78,15 @@ pub mod pipeline;
 #[cfg(windows)]
 mod picked;
 #[cfg(windows)]
+mod pix;
+#[cfg(windows)]
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod prof;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]

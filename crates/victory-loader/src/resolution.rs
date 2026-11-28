@@ -39,6 +39,9 @@
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
 
 use crate::frame_rate::Patched;
+pub use crate::patch::{Site, matches};
+#[cfg(windows)]
+pub use crate::patch::write;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -99,12 +102,36 @@ pub fn asked_upscaler() -> Option<u32> {
     kind
 }
 
-/// A place to change: its offset in the image and the bytes there
-/// (compared first; the replacement is at most as long).
-pub struct Site {
-    pub at: usize,
-    pub what: &'static str,
-    pub bytes: &'static [u8],
+/// Rounds `scale` so that `(out_w * s) as u32` and `(out_h * s) as u32` are
+/// both even (matching PS5 unlocker's half-res reflection buffer invariant:
+/// odd internal dimensions cause reflection sampling artifacts).
+pub fn even_render_scale(out_w: u32, out_h: u32, scale: f32) -> f32 {
+    if !scale.is_finite() || out_w == 0 || out_h == 0 {
+        return scale;
+    }
+    let w0 = (out_w as f32 * scale) as u32;
+    let h0 = (out_h as f32 * scale) as u32;
+    if (w0 & 1) == 0 && (h0 & 1) == 0 {
+        return scale;
+    }
+    let base_h = (h0 & !1) as i32;
+    for k in 0..=32i32 {
+        let delta = if (k & 1) != 0 { k + 1 } else { -k };
+        let h = base_h + delta;
+        if h < 64 || h as u32 > out_h {
+            continue;
+        }
+        let s = (h as f32 + 0.25) / out_h as f32;
+        if !(0.5..=1.0).contains(&s) {
+            continue;
+        }
+        let w2 = (out_w as f32 * s) as u32;
+        let h2 = (out_h as f32 * s) as u32;
+        if (w2 & 1) == 0 && h2 == h as u32 {
+            return s;
+        }
+    }
+    scale
 }
 
 /// The screen size setter, its screen height, and what +0x22434a0 calls when
@@ -244,76 +271,58 @@ pub fn picker_code(kind: u32) -> Vec<u8> {
     c
 }
 
-/// Compares `site`'s bytes in the image of `size` bytes at `base`.
-///
-/// # Safety
-/// The image is mapped.
-pub unsafe fn matches(base: usize, size: usize, site: &Site) -> Patched {
-    if site.at.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
-        return Patched::Failed("outside the image");
-    }
-    // SAFETY: inside the mapped image (checked above).
-    let there = unsafe { std::slice::from_raw_parts((base + site.at) as *const u8, site.bytes.len()) };
-    if there == site.bytes { Patched::Done } else { Patched::Differs }
-}
-
-/// Writes `code` over `site` if its bytes are the expected ones.
-///
-/// # Safety
-/// The image stays mapped and no thread runs its code yet.
-#[cfg(windows)]
-pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patched {
-    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if code.len() > site.bytes.len() {
-        return Patched::Failed("replacement longer than the bytes compared");
-    }
-    // SAFETY: the caller's promise.
-    let found = unsafe { matches(base, size, site) };
-    if found != Patched::Done {
-        return found;
-    }
-    let at = base + site.at;
-    let mut old = 0;
-    // SAFETY: inside the image (checked); made writable for this and put
-    // back; nothing runs it yet.
-    unsafe {
-        if VirtualProtect(at as *const _, code.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-            return Patched::Failed("Windows would not make it writable");
-        }
-        std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len());
-        VirtualProtect(at as *const _, code.len(), old, &mut old);
-        FlushInstructionCache(GetCurrentProcess(), at as *const _, code.len());
-    }
-    Patched::Done
-}
-
 /// Applies what the switches ask for; a line each in the log and on
-/// standard output.
+/// standard output. Dependent sites (output size + back-buffer pool check)
+/// are verified and written transactionally so a partial build mismatch
+/// cannot leave the `int3` pool check armed against a non-4K output size.
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
-    let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+    use crate::patch::{Change, apply_set};
+
+    let output = asked_output();
+    if let Some((w, h)) = output {
+        let mut changes = vec![Change {
+            site: &OUTPUT,
+            code: output_code(w, h),
+        }];
         if (w, h) != (3840, 2160) {
-            asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            changes.push(Change {
+                site: &POOL_CHECK,
+                code: pool_check_code(),
+            });
+        }
+        // SAFETY: the caller's promise.
+        let done = unsafe { apply_set(base, size, &changes) };
+        let value = format!("{w}x{h}");
+        for c in &changes {
+            let offset = format!("{:#x}", c.site.at);
+            match done {
+                Patched::Done => tracing::info!(site = %offset, what = c.site.what, value, "resolution: patched"),
+                Patched::Differs => tracing::warn!(site = %offset, what = c.site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)"),
+                Patched::Failed(why) => tracing::warn!(site = %offset, what = c.site.what, why, "resolution: not patched"),
+            }
+            println!("resolution: {} ({value}) at title+{offset}: {done:?}", c.site.what);
         }
     }
+
+    let (out_w, out_h) = output.unwrap_or((3840, 2160));
+    let mut singles: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        let safe_s = even_render_scale(out_w, out_h, s);
+        singles.push((&OWN_SCALE, own_scale_code(safe_s), format!("{safe_s:.4}")));
     }
     if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        let safe_s = even_render_scale(out_w, out_h, s);
+        singles.push((&FFX_SCALE, ffx_scale_code(safe_s), format!("{safe_s:.4}")));
     }
     if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        singles.push((&PICKER, picker_code(kind), format!("returns {kind}")));
     }
-    for (site, code, value) in asked {
+    for (site, code, value) in singles {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
         let offset = format!("{:#x}", site.at);

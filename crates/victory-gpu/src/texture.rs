@@ -64,6 +64,12 @@ pub(crate) struct Staging {
     once: std::sync::atomic::AtomicBool,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// Linear subresource bytes needed for `CopyTextureRegion` (equals `bytes`
+    /// on the CPU detile path, or the target scratch size when `gpu_raw`).
+    linear_bytes: u64,
+    /// When true, `buffer` holds raw Xbox-tiled bytes copied directly on CPU,
+    /// and [`crate::detile::record`] detiles them on the GPU inside `prelude`.
+    gpu_raw: bool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -901,7 +907,35 @@ pub(crate) struct Digest(u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
+    upload_from_inner(list, resource, None, first);
+}
+
+/// Like [`upload_from`], reusing an already-fetched `HostTexture` copy to avoid
+/// redundant `made` mutex locks and `Arc` refcount churn in hot draw paths.
+pub(crate) fn upload_from_copy(
+    list: &HostList,
+    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+    first: u32,
+) {
+    upload_from_inner(list, resource, Some(copy), first);
+}
+
+fn upload_from_inner(
+    list: &HostList,
+    resource: This,
+    existing_copy: Option<&Arc<crate::resource::HostTexture>>,
+    first: u32,
+) {
     let first = if crate::resource::held_only() { first } else { 0 };
+    // Check cheap per-list dedupe BEFORE locking the global `HOST_WRITTEN` set:
+    // repeated draws using the same texture in one list exit lock-free.
+    if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
+        return;
+    }
+    if !list.first_use(resource as usize) && staged_from(resource) <= first {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -912,20 +946,20 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if host_written {
         return;
     }
-    // Once a list for each first level; not again for one that the list's
-    // upload of larger ones held too.
-    if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
-        return;
-    }
-    if !list.first_use(resource as usize) && staged_from(resource) <= first {
-        return;
-    }
-    let Some(copy) = crate::resource::host_copy(resource) else {
-        return;
+    let fetched;
+    let copy = match existing_copy {
+        Some(c) => c,
+        None => {
+            let Some(c) = crate::resource::host_copy(resource) else {
+                return;
+            };
+            fetched = c;
+            &fetched
+        }
     };
     let texture = &copy.texture;
-    ahead::listed(&copy);
-    let Some(staging) = staging(resource, &copy, first) else {
+    ahead::listed(copy);
+    let Some(staging) = staging(resource, copy, first) else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
@@ -1013,7 +1047,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         let Some(on_demand) = on_demand else {
             list.defer_texture(PreludeUpload {
                 staging,
-                copy,
+                copy: copy.clone(),
                 on_demand: None,
             });
             list.defer_host(move || noted.note_held());
@@ -1044,7 +1078,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     list.defer_texture(PreludeUpload {
         staging,
-        copy,
+        copy: copy.clone(),
         on_demand,
     });
 }
@@ -1111,9 +1145,45 @@ impl PreludeUpload {
         Some(first_upload)
     }
 
-    /// Records `CopyTextureRegion` onto `cmd_list` (the prelude command list).
+    /// Whether this upload holds raw tiled bytes to be detiled on the GPU.
+    pub(crate) fn is_gpu_raw(&self) -> bool {
+        self.staging.gpu_raw
+    }
+
+    /// Builds a [`crate::detile::BatchItem`] borrowing this upload's resources.
+    pub(crate) fn detile_item(&self) -> crate::detile::BatchItem<'_> {
+        crate::detile::BatchItem {
+            raw_buffer: &self.staging.buffer,
+            raw_base: self.staging.base,
+            raw_size: self.staging.read.next_multiple_of(4) as u32,
+            layout: &self.staging.layout,
+            mips: self.staging.mips,
+            first: self.staging.first,
+            level0: self.staging.level0,
+            footprints: &self.staging.footprints,
+            total_linear_bytes: self.staging.linear_bytes,
+            texture: &self.copy.texture,
+        }
+    }
+
+    /// Reverts the claim made by [`Self::finish_refresh`] when a `gpu_raw`
+    /// upload could not be recorded (for example scratch OOM), so it retries
+    /// cleanly on the next submission instead of copying tiled bytes as linear.
+    pub(crate) fn upload_skipped(&self, first_upload: bool) {
+        use std::sync::atomic::Ordering::Release;
+        if first_upload {
+            self.staging.uploaded.store(false, Release);
+        }
+        self.staging.dirty.store(true, Release);
+        *self.staging.holds.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Records linear `CopyTextureRegion` onto `cmd_list` (the prelude command list).
     /// `self.copy.texture` must already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
-    pub(crate) fn record(&self, _host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+    /// Must only be called for non-`gpu_raw` uploads; `gpu_raw` uploads go
+    /// through [`crate::detile::record_batch`].
+    pub(crate) fn record_linear(&self, cmd_list: &ID3D12GraphicsCommandList) {
+        debug_assert!(!self.staging.gpu_raw, "gpu_raw upload must use detile::record_batch");
         let texture = &self.copy.texture;
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -1536,11 +1606,26 @@ impl Staging {
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
+            // big pools is too slow to ask page by page. On the write-watched
+            // path no hash is taken, so `gpu_raw` copies straight into staging
+            // upload memory without an intermediate CPU buffer copy.
+            if self.gpu_raw {
+                if crate::epoch::on() {
+                    crate::epoch::LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.dirty.store(true, std::sync::atomic::Ordering::Release);
+                crate::host::copy_mapped(self.data, self.memory, size, false);
+                let pad = size.next_multiple_of(4) - size;
+                if pad > 0 {
+                    // SAFETY: `self.data` holds `self.read.next_multiple_of(4)` mapped upload bytes.
+                    unsafe { std::ptr::write_bytes(self.data.add(size), 0, pad) };
+                }
+            } else {
+                with_read(size, |read| {
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    self.detile(read);
+                });
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -1786,6 +1871,18 @@ impl Staging {
             crate::epoch::LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        if self.gpu_raw {
+            let n = tiled.len().min(self.read);
+            // SAFETY: `self.data` holds `self.read.next_multiple_of(4)` mapped upload bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, n);
+                let pad = n.next_multiple_of(4) - n;
+                if pad > 0 {
+                    std::ptr::write_bytes(self.data.add(n), 0, pad);
+                }
+            }
+            return;
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -2183,7 +2280,15 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
+    let gpu_raw = !BAKING.get()
+        && crate::detile::on()
+        && crate::detile::eligible(&layout, on_demand, total, read);
+    let alloc_bytes = if gpu_raw {
+        (read as u64).next_multiple_of(4)
+    } else {
+        total
+    };
+    let (piece, buffer, base, data) = match crate::pool::staging(host, alloc_bytes) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
@@ -2193,7 +2298,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                 crate::residency::note_staging_deferred();
                 return None;
             }
-            let (buffer, data) = host.upload_buffer(total)?;
+            let (buffer, data) = host.upload_buffer(alloc_bytes)?;
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
@@ -2203,15 +2308,15 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             (None, buffer, 0, data)
         }
     };
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, alloc_bytes, gpu_raw, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(alloc_bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         base,
         _piece: piece,
         #[cfg(feature = "diagnostics")]
-        size: total,
+        size: alloc_bytes,
         data,
         footprints,
         rows,
@@ -2223,7 +2328,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         serial: copy.serial,
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
-        bytes: total,
+        bytes: alloc_bytes,
+        linear_bytes: total,
+        gpu_raw,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

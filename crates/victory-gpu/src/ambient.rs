@@ -888,6 +888,16 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[11] = reflect_cap.to_bits();
     words[12] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
+    let _pix = crate::pix::Scope::begin(
+        l,
+        match role {
+            Role::Radiance => c"VIctory: Ambient Radiance",
+            Role::Air => c"VIctory: Ambient Air",
+            Role::Reflect => c"VIctory: Ambient Reflect Cap",
+            Role::Resolve => c"VIctory: Ambient GI Resolve",
+            Role::Miss => c"VIctory: Ambient Specular Miss",
+        },
+    );
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.
