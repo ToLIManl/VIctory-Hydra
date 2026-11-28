@@ -22,6 +22,7 @@ struct Config {
     min_draws: u64,
     abort_s: f64,
     record_dir: Option<PathBuf>,
+    start_file: Option<PathBuf>,
 }
 
 fn config() -> Option<&'static Config> {
@@ -50,12 +51,16 @@ fn config() -> Option<&'static Config> {
         let record_dir = std::env::var_os("VICTORY_BENCH_RECORD_DIR")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from);
+        let start_file = std::env::var_os("VICTORY_BENCH_START_FILE")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
         Some(Config {
             world_s,
             warmup_s,
             min_draws,
             abort_s,
             record_dir,
+            start_file,
         })
     })
     .as_ref()
@@ -74,20 +79,22 @@ struct State {
     last_present: Instant,
     last_drawn: u64,
     world_at: Option<Instant>,
+    locked_at: Option<Instant>,
     triggered_record: bool,
     samples: Vec<f32>,
     draws_sum: u64,
 }
 
-fn summarize(samples: &mut [f32]) -> (f32, f32, f32) {
+fn summarize(samples: &mut [f32]) -> (f32, f32, f32, f32) {
     if samples.is_empty() {
-        return (0.0, 0.0, 0.0);
+        return (0.0, 0.0, 0.0, 0.0);
     }
     let mean = samples.iter().sum::<f32>() / samples.len() as f32;
     samples.sort_by(f32::total_cmp);
     let median = samples[samples.len() / 2];
     let p90 = samples[(samples.len() * 9) / 10];
-    (mean, median, p90)
+    let p99 = samples[(samples.len() * 99) / 100];
+    (mean, median, p90, p99)
 }
 
 /// Called once per presented frame from `queue::present`.
@@ -106,6 +113,7 @@ pub(crate) fn presented(frame: u64) {
         last_present: now,
         last_drawn: drawn,
         world_at: None,
+        locked_at: None,
         triggered_record: false,
         samples: Vec::with_capacity(1024),
         draws_sum: 0,
@@ -130,7 +138,30 @@ pub(crate) fn presented(frame: u64) {
     };
 
     if let Some(world_at) = st.world_at {
-        let world_s = (now - world_at).as_secs_f64();
+        let anchor = if let Some(start_file) = &cfg.start_file {
+            if st.locked_at.is_none() {
+                if start_file.exists() {
+                    st.locked_at = Some(now);
+                    let line = format!("BENCH_LOCK_CONFIRMED: frame={frame} since_world_s={:.1}", (now - world_at).as_secs_f64());
+                    tracing::info!("{line}");
+                    println!("{line}");
+                } else {
+                    if (now - st.boot).as_secs_f64() >= cfg.abort_s {
+                        let line = format!("BENCH_TIMEOUT: boot_s={:.1} frame={frame} waiting_for_lock=1", (now - st.boot).as_secs_f64());
+                        tracing::error!("{line}");
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(3);
+                    }
+                    return;
+                }
+            }
+            st.locked_at.unwrap_or(world_at)
+        } else {
+            world_at
+        };
+        let world_s = (now - anchor).as_secs_f64();
         if world_s >= cfg.warmup_s {
             if !st.triggered_record
                 && let Some(dir) = &cfg.record_dir
@@ -149,13 +180,13 @@ pub(crate) fn presented(frame: u64) {
         }
         if world_s >= cfg.warmup_s + cfg.world_s {
             let boot_s = (world_at - st.boot).as_secs_f64();
-            let (mean_ms, median_ms, p90_ms) = summarize(&mut st.samples);
+            let (mean_ms, median_ms, p90_ms, p99_ms) = summarize(&mut st.samples);
             let n = st.samples.len();
             let median_fps = if median_ms > 0.0 { 1000.0 / median_ms } else { 0.0 };
             let mean_fps = if mean_ms > 0.0 { 1000.0 / mean_ms } else { 0.0 };
             let avg_draws = st.draws_sum as f64 / n.max(1) as f64;
             let line = format!(
-                "BENCH_RESULT: boot_s={boot_s:.1} world_s={:.1} frames={n} median_fps={median_fps:.2} mean_fps={mean_fps:.2} median_ms={median_ms:.1} mean_ms={mean_ms:.1} p90_ms={p90_ms:.1} avg_draws={avg_draws:.0}",
+                "BENCH_RESULT: boot_s={boot_s:.1} world_s={:.1} frames={n} median_fps={median_fps:.2} mean_fps={mean_fps:.2} median_ms={median_ms:.1} mean_ms={mean_ms:.1} p90_ms={p90_ms:.1} p99_ms={p99_ms:.1} avg_draws={avg_draws:.0}",
                 world_s - cfg.warmup_s
             );
             tracing::info!("{line}");
@@ -184,9 +215,10 @@ mod tests {
     #[test]
     fn summarizes_frametimes() {
         let mut s = [50.0, 20.0, 30.0, 40.0, 100.0];
-        let (mean, med, p90) = summarize(&mut s);
+        let (mean, med, p90, p99) = summarize(&mut s);
         assert!((mean - 48.0).abs() < 1e-4);
         assert_eq!(med, 40.0);
         assert_eq!(p90, 100.0);
+        assert_eq!(p99, 100.0);
     }
 }

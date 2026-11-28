@@ -60,6 +60,7 @@ std::mutex g_queue_mu;
 std::queue<std::shared_ptr<PendingCmd>> g_queue;
 std::atomic<uint64_t> g_ticks{0};
 std::atomic<bool> g_ready{false};
+std::atomic<bool> g_bench_hold{false};
 
 uint32_t Joaat(const char* s) {
     uint32_t h = 0;
@@ -273,6 +274,30 @@ std::string HandleGenericNative(const std::string& json) {
     return buf;
 }
 
+// Verify that the player ped exists, has a non-null native entity pointer,
+// and (when require_faded_in is true) the screen fade-in has completed.
+// Prevents 0xC0000005 null-deref crashes when commands arrive during loading.
+bool CheckPlayerReady(shvi_entity_ref& out_ped, void*& out_ptr, bool require_faded_in, bool& out_faded_in) {
+    using namespace shvi::nativedb::all;
+    out_ped = {0, 0};
+    out_ptr = nullptr;
+    out_faded_in = true;
+    if (!g_api) return false;
+    if (HasNative("IS_SCREEN_FADED_IN")) {
+        out_faded_in = IS_SCREEN_FADED_IN();
+        if (require_faded_in && !out_faded_in) return false;
+    }
+    if (!HasNative("PLAYER_PED_ID") || !HasNative("DOES_ENTITY_EXIST")) return false;
+    shvi_entity_ref ped = PLAYER_PED_ID();
+    if (ped.lo == 0 && ped.hi == 0) return false;
+    if (!DOES_ENTITY_EXIST(ped)) return false;
+    void* ptr = (SHVI_API_HAS(g_api, entity_ptr)) ? g_api->entity_ptr(&ped) : nullptr;
+    if (!ptr) return false;
+    out_ped = ped;
+    out_ptr = ptr;
+    return true;
+}
+
 std::string ExecuteOnScriptThread(const std::string& json) {
     using namespace shvi::nativedb::all;
     if (!g_api) return R"({"ok":false,"err":"shvi api not initialized"})";
@@ -302,23 +327,36 @@ std::string ExecuteOnScriptThread(const std::string& json) {
     }
 
     if (cmd == "game.player") {
-        if (!HasNative("PLAYER_PED_ID") || !HasNative("GET_ENTITY_COORDS")) {
+        shvi_entity_ref ped{0, 0};
+        void* ptr = nullptr;
+        bool faded_in = true;
+        if (!CheckPlayerReady(ped, ptr, false, faded_in)) {
+            return R"({"ok":false,"err":"not_ready","reason":"player_ped_unavailable"})";
+        }
+        if (!HasNative("GET_ENTITY_COORDS")) {
             return R"({"ok":false,"err":"player natives unavailable"})";
         }
-        shvi_entity_ref ped = PLAYER_PED_ID();
         auto pos = GET_ENTITY_COORDS(ped, true);
         float heading = HasNative("GET_ENTITY_HEADING") ? GET_ENTITY_HEADING(ped) : 0.0f;
         int hp = HasNative("GET_ENTITY_HEALTH") ? GET_ENTITY_HEALTH(ped) : 0;
         int max_hp = HasNative("GET_ENTITY_MAX_HEALTH") ? GET_ENTITY_MAX_HEALTH(ped, false) : 0;
-        void* ptr = (SHVI_API_HAS(g_api, entity_ptr)) ? g_api->entity_ptr(&ped) : nullptr;
-        char buf[384];
+        using CamVec3 = decltype(GET_GAMEPLAY_CAM_COORD());
+        CamVec3 cam_pos{0, 0, 0};
+        CamVec3 cam_rot{0, 0, 0};
+        float cam_fov = 0.0f;
+        if (HasNative("GET_GAMEPLAY_CAM_COORD")) cam_pos = GET_GAMEPLAY_CAM_COORD();
+        if (HasNative("GET_GAMEPLAY_CAM_ROT")) cam_rot = GET_GAMEPLAY_CAM_ROT(2);
+        if (HasNative("GET_GAMEPLAY_CAM_FOV")) cam_fov = GET_GAMEPLAY_CAM_FOV();
+        char buf[640];
         std::snprintf(
             buf, sizeof(buf),
-            R"({"ok":true,"ped_lo":"0x%016llx","ped_hi":"0x%016llx","entity_ptr":"0x%llx","x":%.3f,"y":%.3f,"z":%.3f,"heading":%.2f,"health":%d,"max_health":%d})",
+            R"({"ok":true,"faded_in":%s,"ped_lo":"0x%016llx","ped_hi":"0x%016llx","entity_ptr":"0x%llx","x":%.3f,"y":%.3f,"z":%.3f,"heading":%.2f,"health":%d,"max_health":%d,"cam_x":%.3f,"cam_y":%.3f,"cam_z":%.3f,"cam_rx":%.2f,"cam_ry":%.2f,"cam_rz":%.2f,"cam_fov":%.2f})",
+            faded_in ? "true" : "false",
             static_cast<unsigned long long>(ped.lo),
             static_cast<unsigned long long>(ped.hi),
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr)),
-            pos.x, pos.y, pos.z, heading, hp, max_hp);
+            pos.x, pos.y, pos.z, heading, hp, max_hp,
+            cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z, cam_fov);
         return buf;
     }
 
@@ -361,10 +399,8 @@ std::string ExecuteOnScriptThread(const std::string& json) {
         JsonGetString(json, "name", wname);
         uint32_t whash = Joaat(wname.c_str());
         if (HasNative("SET_WEATHER_TYPE")) {
-            SET_WEATHER_TYPE(whash, true, true, false, 0.0f, false, false);
-        }
-        if (HasNative("_SET_WEATHER_TYPE_FROZEN")) {
-            _SET_WEATHER_TYPE_FROZEN(true);
+            // Exact script-verified form from ScriptHook VI trainer.hpp:1577.
+            SET_WEATHER_TYPE(whash, true, true, false, 0.0f, false, true);
         }
         char buf[192];
         std::snprintf(buf, sizeof(buf),
@@ -374,33 +410,53 @@ std::string ExecuteOnScriptThread(const std::string& json) {
     }
 
     if (cmd == "game.teleport") {
-        double x = 0, y = 0, z = 0;
+        shvi_entity_ref ped{0, 0};
+        void* ptr = nullptr;
+        bool faded_in = true;
+        if (!CheckPlayerReady(ped, ptr, false, faded_in)) {
+            return R"({"ok":false,"err":"not_ready","reason":"player_ped_unavailable"})";
+        }
+        double x = 0, y = 0, z = 0, heading = 0;
         if (!JsonGetNumber(json, "x", x) || !JsonGetNumber(json, "y", y) || !JsonGetNumber(json, "z", z)) {
             return R"({"ok":false,"err":"missing x/y/z"})";
         }
-        shvi_entity_ref ped = PLAYER_PED_ID();
         auto target = GET_ENTITY_COORDS(ped, true);
         target.x = static_cast<float>(x);
         target.y = static_cast<float>(y);
         target.z = static_cast<float>(z);
-        SET_ENTITY_COORDS_NO_OFFSET(ped, target, false, false, false, 0.0f);
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), R"({"ok":true,"x":%.3f,"y":%.3f,"z":%.3f})", x, y, z);
+        if (HasNative("SET_ENTITY_COORDS")) {
+            SET_ENTITY_COORDS(ped, target, false, false, false, false, -1.0f);
+        }
+        if (JsonGetNumber(json, "heading", heading) && HasNative("SET_ENTITY_HEADING")) {
+            SET_ENTITY_HEADING(ped, static_cast<float>(heading));
+        }
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), R"({"ok":true,"x":%.3f,"y":%.3f,"z":%.3f,"heading":%.2f})", x, y, z, heading);
         return buf;
     }
 
     if (cmd == "game.god") {
+        shvi_entity_ref ped{0, 0};
+        void* ptr = nullptr;
+        bool faded_in = true;
+        if (!CheckPlayerReady(ped, ptr, false, faded_in)) {
+            return R"({"ok":false,"err":"not_ready","reason":"player_ped_unavailable"})";
+        }
         double on = 1;
         JsonGetNumber(json, "on", on);
-        shvi_entity_ref ped = PLAYER_PED_ID();
         SET_ENTITY_INVINCIBLE(ped, on != 0.0);
         return on != 0.0 ? R"({"ok":true,"god":true})" : R"({"ok":true,"god":false})";
     }
 
     if (cmd == "game.freeze") {
+        shvi_entity_ref ped{0, 0};
+        void* ptr = nullptr;
+        bool faded_in = true;
+        if (!CheckPlayerReady(ped, ptr, false, faded_in)) {
+            return R"({"ok":false,"err":"not_ready","reason":"player_ped_unavailable"})";
+        }
         double on = 1;
         JsonGetNumber(json, "on", on);
-        shvi_entity_ref ped = PLAYER_PED_ID();
         FREEZE_ENTITY_POSITION(ped, on != 0.0);
         return on != 0.0 ? R"({"ok":true,"frozen":true})" : R"({"ok":true,"frozen":false})";
     }
@@ -417,18 +473,66 @@ std::string ExecuteOnScriptThread(const std::string& json) {
     }
 
     if (cmd == "game.bench_lock") {
+        shvi_entity_ref ped{0, 0};
+        void* ptr = nullptr;
+        bool faded_in = true;
+        if (!CheckPlayerReady(ped, ptr, true, faded_in)) {
+            char buf[160];
+            std::snprintf(
+                buf, sizeof(buf),
+                R"({"ok":false,"err":"not_ready","faded_in":%s,"entity_ptr":"0x%llx"})",
+                faded_in ? "true" : "false",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr)));
+            return buf;
+        }
+        // Hold clock at 12:00:00 and weather at EXTRASUNNY via periodic script tick
+        // instead of `PAUSE_CLOCK` (0x3CD53C0), which dereferences a null clock
+        // subsystem pointer (+0x29974e8 read 0x123) if invoked early after world load.
         if (HasNative("SET_CLOCK_TIME")) SET_CLOCK_TIME(12, 0, 0, false);
-        if (HasNative("PAUSE_CLOCK")) PAUSE_CLOCK(true, false);
         if (HasNative("SET_WEATHER_TYPE")) {
-            SET_WEATHER_TYPE(Joaat("EXTRASUNNY"), true, true, false, 0.0f, false, false);
+            // Exact script-verified form (trainer.hpp:1577); do NOT call
+            // `_SET_WEATHER_TYPE_FROZEN` or `CREATE_CAMERA_WITH_PARAMS` which
+            // fault on worker-thread script-heap object registration.
+            SET_WEATHER_TYPE(Joaat("EXTRASUNNY"), true, true, false, 0.0f, false, true);
         }
-        if (HasNative("_SET_WEATHER_TYPE_FROZEN")) _SET_WEATHER_TYPE_FROZEN(true);
-        if (HasNative("PLAYER_PED_ID") && HasNative("FREEZE_ENTITY_POSITION")) {
-            shvi_entity_ref ped = PLAYER_PED_ID();
-            FREEZE_ENTITY_POSITION(ped, true);
-            if (HasNative("SET_ENTITY_INVINCIBLE")) SET_ENTITY_INVINCIBLE(ped, true);
+        g_bench_hold.store(true, std::memory_order_release);
+
+        // Lock ped position and heading (radians, per trainer.hpp:1525).
+        auto pos = GET_ENTITY_COORDS(ped, true);
+        double px = pos.x, py = pos.y, pz = pos.z;
+        bool has_pos = JsonGetNumber(json, "x", px) && JsonGetNumber(json, "y", py) && JsonGetNumber(json, "z", pz);
+        if (has_pos && HasNative("SET_ENTITY_COORDS")) {
+            pos.x = static_cast<float>(px);
+            pos.y = static_cast<float>(py);
+            pos.z = static_cast<float>(pz);
+            SET_ENTITY_COORDS(ped, pos, false, false, false, false, -1.0f);
         }
-        return R"({"ok":true,"bench_locked":true,"clock":"12:00:00","weather":"EXTRASUNNY","frozen":true})";
+        float heading = HasNative("GET_ENTITY_HEADING") ? GET_ENTITY_HEADING(ped) : 0.0f;
+        double req_h = heading;
+        if (JsonGetNumber(json, "heading", req_h) && HasNative("SET_ENTITY_HEADING")) {
+            heading = static_cast<float>(req_h);
+            SET_ENTITY_HEADING(ped, heading);
+        }
+        if (HasNative("FREEZE_ENTITY_POSITION")) FREEZE_ENTITY_POSITION(ped, true);
+        if (HasNative("SET_ENTITY_INVINCIBLE")) SET_ENTITY_INVINCIBLE(ped, true);
+        if (HasNative("STOP_GAMEPLAY_CAM_SHAKING")) STOP_GAMEPLAY_CAM_SHAKING(true);
+
+        // Read back live gameplay camera pose and FOV so callers verify identical frustum.
+        using CamVec3 = decltype(GET_GAMEPLAY_CAM_COORD());
+        CamVec3 cam_pos = HasNative("GET_GAMEPLAY_CAM_COORD") ? GET_GAMEPLAY_CAM_COORD() : CamVec3{0, 0, 0};
+        CamVec3 cam_rot = HasNative("GET_GAMEPLAY_CAM_ROT") ? GET_GAMEPLAY_CAM_ROT(2) : CamVec3{0, 0, 0};
+        float cam_fov = HasNative("GET_GAMEPLAY_CAM_FOV") ? GET_GAMEPLAY_CAM_FOV() : 0.0f;
+        char buf[640];
+        std::snprintf(
+            buf, sizeof(buf),
+            R"({"ok":true,"bench_locked":true,"cam_locked":true,"clock":"12:00:00","weather":"EXTRASUNNY","frozen":true,"x":%.3f,"y":%.3f,"z":%.3f,"heading":%.4f,"cam_x":%.3f,"cam_y":%.3f,"cam_z":%.3f,"cam_rx":%.2f,"cam_ry":%.2f,"cam_rz":%.2f,"cam_fov":%.2f})",
+            pos.x, pos.y, pos.z, heading,
+            cam_pos.x, cam_pos.y, cam_pos.z, cam_rot.x, cam_rot.y, cam_rot.z, cam_fov);
+        return buf;
+    }
+
+    if (cmd == "game.cam_release") {
+        return R"({"ok":true,"cam_locked":false})";
     }
 
     return std::string(R"({"ok":false,"err":"unknown game cmd","cmd":)") + JsonEscape(cmd) + "}";
@@ -436,7 +540,14 @@ std::string ExecuteOnScriptThread(const std::string& json) {
 
 void OnScriptTick(void*) {
     g_ready.store(true, std::memory_order_release);
-    g_ticks.fetch_add(1, std::memory_order_relaxed);
+    uint64_t tick = g_ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_bench_hold.load(std::memory_order_acquire) && (tick % 60 == 0)) {
+        using namespace shvi::nativedb::all;
+        if (HasNative("SET_CLOCK_TIME")) SET_CLOCK_TIME(12, 0, 0, false);
+        if (HasNative("SET_WEATHER_TYPE")) {
+            SET_WEATHER_TYPE(Joaat("EXTRASUNNY"), true, true, false, 0.0f, false, true);
+        }
+    }
 
     // Drain up to 8 commands per script tick so we never stall the frame.
     for (int i = 0; i < 8; ++i) {

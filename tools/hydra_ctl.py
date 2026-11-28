@@ -119,7 +119,10 @@ def run_once(args: argparse.Namespace) -> int:
         elif cmd == "weather":
             pretty(send_cmd({"cmd": "game.weather", "name": args.name}, pipe))
         elif cmd == "tp":
-            pretty(send_cmd({"cmd": "game.teleport", "x": args.x, "y": args.y, "z": args.z}, pipe))
+            payload = {"cmd": "game.teleport", "x": args.x, "y": args.y, "z": args.z}
+            if args.heading is not None:
+                payload["heading"] = args.heading
+            pretty(send_cmd(payload, pipe))
         elif cmd == "god":
             pretty(send_cmd({"cmd": "game.god", "on": 1 if args.state in ("1", "on", "true") else 0}, pipe))
         elif cmd == "freeze":
@@ -127,7 +130,16 @@ def run_once(args: argparse.Namespace) -> int:
         elif cmd == "timescale":
             pretty(send_cmd({"cmd": "game.timescale", "scale": args.scale}, pipe))
         elif cmd == "bench-lock":
-            pretty(send_cmd({"cmd": "game.bench_lock"}, pipe))
+            payload = {"cmd": "game.bench_lock"}
+            for k in ("x", "y", "z", "heading", "cx", "cy", "cz", "rx", "ry", "rz", "fov"):
+                v = getattr(args, k, None)
+                if v is not None:
+                    payload[k] = v
+            res = send_cmd(payload, pipe)
+            pretty(res)
+            return 0 if res.get("ok") else 4
+        elif cmd == "cam-release":
+            pretty(send_cmd({"cmd": "game.cam_release"}, pipe))
         elif cmd == "native":
             typed = [parse_typed_arg(a) for a in args.args]
             pretty(send_cmd({"cmd": "game.native", "name": args.name, "args": typed}, pipe))
@@ -211,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     tp.add_argument("x", type=float)
     tp.add_argument("y", type=float)
     tp.add_argument("z", type=float)
+    tp.add_argument("--heading", type=float, default=None)
 
     g = sub.add_parser("god", help="Toggle player invincibility (on/off)")
     g.add_argument("state")
@@ -221,7 +234,10 @@ def build_parser() -> argparse.ArgumentParser:
     ts = sub.add_parser("timescale", help="Set RAGE 9 time scale (e.g. 0.5, 1.0)")
     ts.add_argument("scale", type=float)
 
-    sub.add_parser("bench-lock", help="Freeze clock (12:00), weather (EXTRASUNNY), and player position for A/B benchmarks")
+    bl = sub.add_parser("bench-lock", help="Freeze clock (12:00), weather (EXTRASUNNY), player position, and scripted camera for A/B benchmarks")
+    for opt in ("--x", "--y", "--z", "--heading", "--cx", "--cy", "--cz", "--rx", "--ry", "--rz", "--fov"):
+        bl.add_argument(opt, type=float, default=None)
+    sub.add_parser("cam-release", help="Release locked scripted camera back to gameplay camera")
 
     nv = sub.add_parser("native", help="Call any of 6,829 GTA 6 natives by name or 0xhash")
     nv.add_argument("name", help="Native name (e.g. SET_CLOCK_TIME) or 0x... hash")
