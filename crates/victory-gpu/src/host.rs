@@ -247,7 +247,7 @@ struct Aside {
     list: ID3D12CommandList,
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
-    value: u64,
+    progress: mapping_fence::Progress,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
@@ -306,18 +306,17 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 list: list.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
-                value: 0,
+                progress: mapping_fence::Progress::default(),
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        a.progress.run(
+            || a.queue.ExecuteCommandLists(&[Some(a.list.clone())]),
+            |value, attempt| {
+                mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, attempt)
+            },
+        )?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -935,6 +934,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
+            // Pre-TDR display driver event-log watchdog (nvlddmkm Event 153).
+            crate::drvwatch::start();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // Before anything is made with it (`VICTORY_RECORD`).
@@ -1266,8 +1267,9 @@ pub(crate) struct HostList {
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// when the list first has such transitions ([`lazy_prelude`]), or
+    /// borrowed from [`prelude_pool::IDLE`] under `VICTORY_PRELUDE_POOL=1`.
+    prelude: prelude_pool::Slot,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -4612,6 +4614,86 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without taking the submission lock (`VICTORY_DYNAMIC_WAIT=1`,
+/// on by default; `=0` settles everything under the submission lock).
+fn dynamic_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: draws that found no free dynamic descriptor
+/// slot; total microseconds waited; resolved by a landing; fell back to full
+/// settle; still went without slots.
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Waits for flights to land (returning dynamic descriptor slots) when `take`
+/// returns `None`. Under `VICTORY_DYNAMIC_WAIT=1` + relay, waits on
+/// `LINE_LANDED` without holding the submission lock so other submissions keep
+/// feeding the GPU; otherwise falls back to `settle_for_fence()`.
+pub(crate) fn wait_for_slots<T>(mut take: impl FnMut() -> Option<T>) -> Option<T> {
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if dynamic_wait() && relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            let nothing = {
+                let line = line();
+                line.line.is_empty() && !line.settling
+            };
+            found = take();
+            if found.is_some() || nothing {
+                break;
+            }
+            let line = line();
+            drop(
+                LINE_LANDED
+                    .wait_timeout(line, std::time::Duration::from_millis(1))
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+/// Frame-rate log line for dynamic descriptor slot pressure (`VICTORY_DYNAMIC_WAIT`).
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS
+        .iter()
+        .map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames)
+        .collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Ordering::Relaxed);
+    if low == u32::MAX && w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: fewest free {} of {}; per frame {:.2} draws waited \
+         {:.1} ms ({:.2} after a landing, {:.2} settled under lock, {:.2} went without; \
+         VICTORY_DYNAMIC_WAIT={})",
+        if low == u32::MAX { 0 } else { low },
+        crate::descriptor::host::DYNAMIC_LOW[1].load(Ordering::Relaxed),
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -5061,6 +5143,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    dynamic_wait_line(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
@@ -5082,6 +5165,8 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 mod font;
+mod mapping_fence;
+mod prelude_pool;
 pub(crate) mod indirects;
 pub(crate) mod lean;
 pub(crate) mod menu;
@@ -5091,7 +5176,6 @@ pub(crate) mod rec;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
-#[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
 #[cfg(feature = "diagnostics")]
@@ -5513,10 +5597,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
+            let prelude = prelude_pool::Slot::new(self);
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -5977,17 +6058,43 @@ impl Host {
                     list.Reset(allocator, None)?;
                     // What earlier submissions' shaders wrote, first.
                     list.ResourceBarrier(&[card_uav_barrier(None)]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in ahead.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        card_pass(list, &r.span, size as u32, r.at, 2);
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    let ahead_items: Vec<CardBatchItem<'_>> = ahead
+                        .iter()
+                        .filter(|r| r.compared)
+                        .filter_map(|r| {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                return None;
+                            };
+                            Some(CardBatchItem {
+                                buffer: &r.shadow.buffer,
+                                before: before.clone(),
+                                span: r.span,
+                                size: size as u32,
+                                at: r.at,
+                                mode: 2,
+                            })
+                        })
+                        .collect();
+                    let batched = work.batch.as_mut().is_some_and(|batch| {
+                        record_card_batch(self, batch, list, &work.differs.0, &ahead_items)
+                    });
+                    if batched {
+                        if !ahead_items.is_empty() {
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        for r in ahead.iter().filter(|r| r.compared) {
+                            let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                continue;
+                            };
+                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            card_pass(list, &r.span, size as u32, r.at, 2);
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -7634,7 +7741,6 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
-            #[cfg(feature = "diagnostics")]
             let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
@@ -8295,6 +8401,15 @@ impl HostList {
                 give_batch_buffers(buffers);
             }
         }
+        {
+            // Release oversized indirect-argument scratch buffers (> 256 KiB)
+            // on reset so pooled lists do not pin peak high-water VRAM forever.
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > (256 << 10)) {
+                *slot = None;
+            }
+        }
+        self.prelude.recycle(&prelude_pool::IDLE);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -8712,65 +8827,63 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let Some(recorded) = self.prelude.record(&prelude_pool::IDLE, |(allocator, list)| {
+            // SAFETY: the prelude is not executing (every submission is waited
+            // for); the textures are live.
+            let recorded = unsafe {
+                allocator.Reset().and_then(|()| {
+                    list.Reset(allocator, None)?;
+                    let _pix = crate::pix::Scope::begin(list, c"VIctory: Prelude & Texture Uploads");
+                    if !aliasing.is_empty() {
+                        list.ResourceBarrier(&aliasing);
+                    }
+                    if !to_copy.is_empty() {
+                        list.ResourceBarrier(&to_copy);
+                    }
+                    for (depth, twin, colour) in &syncs {
+                        record_twin_copy(list, &depth.texture, twin, *colour);
+                    }
+                    let mut raw_batch: Vec<(&crate::texture::PreludeUpload, bool)> = Vec::new();
+                    let flush_raw = |raw: &mut Vec<(&crate::texture::PreludeUpload, bool)>| {
+                        if raw.is_empty() {
+                            return;
+                        }
+                        let items: Vec<crate::detile::BatchItem<'_>> =
+                            raw.iter().map(|(u, _)| u.detile_item()).collect();
+                        for failed_idx in crate::detile::record_batch(self, list, &items) {
+                            let (upload, first_upload) = raw[failed_idx];
+                            upload.upload_skipped(first_upload);
+                        }
+                        raw.clear();
+                    };
+                    for (upload, first_upload) in uploads {
+                        if upload.is_gpu_raw() {
+                            raw_batch.push((upload, *first_upload));
+                        } else {
+                            // Preserve last-writer-wins order if a linear upload targets
+                            // a texture already queued in the pending GPU-detile batch.
+                            let ptr = std::sync::Arc::as_ptr(&upload.copy);
+                            if raw_batch.iter().any(|(r, _)| std::sync::Arc::as_ptr(&r.copy) == ptr) {
+                                flush_raw(&mut raw_batch);
+                            }
+                            upload.record_linear(list);
+                        }
+                    }
+                    flush_raw(&mut raw_batch);
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    list.Close()
+                })
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("a host state prelude did not record ({e})"));
+            }
+            list.cast().ok()
+        }) else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                let _pix = crate::pix::Scope::begin(list, c"VIctory: Prelude & Texture Uploads");
-                if !aliasing.is_empty() {
-                    list.ResourceBarrier(&aliasing);
-                }
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                let mut raw_batch: Vec<(&crate::texture::PreludeUpload, bool)> = Vec::new();
-                let flush_raw = |raw: &mut Vec<(&crate::texture::PreludeUpload, bool)>| {
-                    if raw.is_empty() {
-                        return;
-                    }
-                    let items: Vec<crate::detile::BatchItem<'_>> =
-                        raw.iter().map(|(u, _)| u.detile_item()).collect();
-                    for failed_idx in crate::detile::record_batch(self, list, &items) {
-                        let (upload, first_upload) = raw[failed_idx];
-                        upload.upload_skipped(first_upload);
-                    }
-                    raw.clear();
-                };
-                for (upload, first_upload) in uploads {
-                    if upload.is_gpu_raw() {
-                        raw_batch.push((upload, *first_upload));
-                    } else {
-                        // Preserve last-writer-wins order if a linear upload targets
-                        // a texture already queued in the pending GPU-detile batch.
-                        let ptr = std::sync::Arc::as_ptr(&upload.copy);
-                        if raw_batch.iter().any(|(r, _)| std::sync::Arc::as_ptr(&r.copy) == ptr) {
-                            flush_raw(&mut raw_batch);
-                        }
-                        upload.record_linear(list);
-                    }
-                }
-                flush_raw(&mut raw_batch);
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        list.cast().ok()
+        recorded
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -11156,8 +11269,18 @@ impl Meter {
         card_clock_line(frames, ms);
         upq::line(frames);
         rec::line(frames);
-        #[cfg(feature = "diagnostics")]
         spans::line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let tracked = crate::pipeline::take_dispatch_stats();
+            if !tracked.is_empty() {
+                let top: Vec<String> = tracked
+                    .iter()
+                    .map(|(h, e, d)| format!("{h}:exec={e},drop={d}"))
+                    .collect();
+                tracing::info!("tracked compute dispatches ({} shaders): {}", tracked.len(), top.join(" "));
+            }
+        }
         crate::shadow::back_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);

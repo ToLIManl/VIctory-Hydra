@@ -621,6 +621,79 @@ fn permutes_outside_sections(p: &ir::Program) -> bool {
 thread_local! {
     /// The hash-scoped wave policy for this thread's current translation.
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's current translation tries paired Wave64 first
+    /// (`DEFAULT_WAVE_PAIRS_HASHES` or `VICTORY_WAVE_PAIRS_ONLY`).
+    static PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Compute programs that take the paired Wave64 form on 32-lane hosts unless
+/// `VICTORY_WAVE_PAIRS_ONLY` overrides them (`0` or `none` disables).
+/// Ported from `TaynanGT/Vice-Tay` (`emit/mod.rs`, GPL-3.0-or-later):
+/// - 18 `CS_ShadowRenderTiled*` shadow-mask programs (fixes 16x16 blocky/stair-stepped shadows)
+/// - 4 water transmission volumetrics programs (fixes dark blocks on open/under water)
+/// - 7 atmospheric diffusion & sky probe programs (fixes dark-silhouette sky halos)
+const DEFAULT_WAVE_PAIRS_HASHES: [&str; 29] = [
+    // shadow mask (CS_ShadowRenderTiled*)
+    "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
+    "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
+    "804b342cb4b9d1e9", "922e1d0ee1e19a85", "ab5455fc6abb804f", "abd7a22106898c66",
+    "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
+    "f133e35efed2a48a", "fa0bd10a35bfef3c",
+    // water transmission volumetrics
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
+    // diffusion / sky probe
+    "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
+    "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
+];
+
+/// Whether container hash `hash` (16 hex digits) should try paired Wave64 first.
+pub fn wave_pairs_only(hash: &str) -> bool {
+    enum Mode {
+        Default,
+        Disabled,
+        Custom(Vec<String>),
+    }
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    match MODE.get_or_init(|| match std::env::var("VICTORY_WAVE_PAIRS_ONLY") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+                Mode::Disabled
+            } else if trimmed.is_empty() {
+                Mode::Default
+            } else {
+                Mode::Custom(
+                    trimmed
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .map(str::to_owned)
+                        .collect(),
+                )
+            }
+        }
+        Err(_) => Mode::Default,
+    }) {
+        Mode::Default => DEFAULT_WAVE_PAIRS_HASHES
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(hash)),
+        Mode::Disabled => false,
+        Mode::Custom(list) => list
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(hash)),
+    }
+}
+
+/// Runs one translation with its own paired-Wave64 priority on this thread.
+pub fn with_wave_pairs<T>(on: bool, translate: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAIRS_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(PAIRS_HERE.replace(on));
+    translate()
 }
 
 /// Uses the wave-wide form only for the named container hashes.
@@ -674,6 +747,18 @@ fn emit_with_paired(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    let wave32_compute =
+        native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    if PAIRS_HERE.get() && wave32_compute {
+        match emit_paired(c, native, p, st) {
+            Ok((shader, Some(32))) => return Ok(shader),
+            Err(e) if std::env::var_os("VICTORY_WAVE_WHY").is_some() => {
+                eprintln!("WAVE64-PAIRS-ONLY refused: {e}; falling back");
+            }
+            _ => {}
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // Keep the general wave-wide form opt-in: the game run lost the GPU after these
     // barriers were enabled automatically for every one-wave group. The insertion guard
@@ -970,28 +1055,26 @@ fn emit_paired(
     p: &ir::Program,
     st: &structure::Structured,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
-    let wide = st
+    let mut wide: std::collections::HashSet<usize> = st
         .wave_any
         .iter()
         .enumerate()
         .filter_map(|(b, kind)| kind.map(|_| b))
         .collect();
-    let st = structure::structure_wide(p, &wide)?;
-    for (b, exit) in st.exits.iter().enumerate() {
-        if let structure::LaneExit::Branch { when, .. } = *exit
-            && !wide.contains(&b)
-            && st
-                .bools
-                .support(when)
-                .iter()
-                .any(|a| !matches!(a, structure::Atom::Uniform(_)))
-        {
-            return Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "a branch without a whole-wave decision",
-            });
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
         }
-    }
+        wide.extend(lanes);
+    };
     let io = io::raise(p, native)?;
     let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
     // (the plain form: the loop-branch retry of `emit_program` is not part of this one)

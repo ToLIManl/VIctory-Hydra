@@ -138,6 +138,7 @@ pub(crate) struct HostHeap {
     /// raw views, and a texture's null view there is read as the wrong kind of descriptor).
     null_raw_srv: Option<(ID3D12DescriptorHeap, usize)>,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1576,6 +1577,24 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        crate::memory::release_heap(std::ptr::from_ref(self) as usize);
+        let gpu = self.gpu;
+        GPU_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(start, _, _, _)| start != gpu);
+        if !self.sampler {
+            let own = std::sync::Arc::as_ptr(&self.placed);
+            PLACED_SPANS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|w| w.strong_count() > 0 && w.as_ptr() != own);
+        }
+    }
+}
+
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -1663,6 +1682,13 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+/// Fewest free dynamic slots a view heap had since the last frame-rate line
+/// (`u32::MAX`: none asked yet), and that heap's total dynamic capacity.
+pub(crate) static DYNAMIC_LOW: [std::sync::atomic::AtomicU32; 2] = [
+    std::sync::atomic::AtomicU32::new(u32::MAX),
+    std::sync::atomic::AtomicU32::new(0),
+];
 
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
@@ -1936,6 +1962,7 @@ impl HostHeap {
             null_srv,
             null_raw_srv,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -2085,6 +2112,11 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            DYNAMIC_LOW[0].fetch_min(
+                self.free.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 let largest_free = bits::largest_free_run(taken, self.dynamic as usize);
@@ -2104,7 +2136,12 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         bits::fill(taken, first, first + n, true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self
+            .free
+            .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(n as u32);
+        DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
@@ -2168,7 +2205,12 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         bits::fill(taken, first, first + got as usize, true);
-        self.free.fetch_sub(got, std::sync::atomic::Ordering::Relaxed);
+        let free = self
+            .free
+            .fetch_sub(got, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(got);
+        DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + got as usize) % end) as u32;
         Some((self.count + first as u32, got))
     }

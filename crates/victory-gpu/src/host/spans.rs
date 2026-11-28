@@ -148,10 +148,12 @@ impl Host {
 /// The GPU timestamps the title was given since the last frame-rate line:
 /// how many, how often a later one was 1 ms or more after the one before
 /// (written with another submission), and where the first few lie.
+#[cfg(feature = "diagnostics")]
 static STAMPED: Mutex<(u64, u64, u64, Vec<usize>)> = Mutex::new((0, 0, 0, Vec::new()));
 
 /// The title's GPU timestamp at `at` was given the value `now` (ticks of 10
 /// ns).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn stamped(at: usize, now: u64) {
     if !on() {
         return;
@@ -168,6 +170,7 @@ pub(crate) fn stamped(at: usize, now: u64) {
 
 /// The viewports' sizes seen (each said once): whether the title draws its
 /// scene at sizes of its choice.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn viewport(width: u32, height: u32) {
     if !on() || width < 1024 || height < 576 {
         return;
@@ -183,6 +186,7 @@ pub(crate) fn viewport(width: u32, height: u32) {
 /// For the frame-rate line: what the stamps read since the last one say, per
 /// frame (they are of some [`SPANS`] submissions ago).
 pub(super) fn line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
     {
         let mut s = STAMPED.lock().unwrap_or_else(|e| e.into_inner());
         if s.0 > 0 {

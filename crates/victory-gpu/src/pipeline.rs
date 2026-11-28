@@ -329,7 +329,15 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         )
     });
     let used = chosen.map(|p| p.used.to_vec()).unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let (used_written, mut write_unknown) = chosen
+        .map(|p| written_used(p, &used))
+        .unwrap_or((Vec::new(), !programs.is_empty()));
+    if programs.len() > 1 {
+        // Another stage's table store could name the same descriptor.
+        write_unknown = true;
+    }
+    let tables =
+        crate::draw::TablePlan::with_written(&used, &host.root_indexed_views, &used_written, write_unknown);
     let bias_slots = slot_bits(host.user_data.iter().filter(|u| u.root == bias_root()).map(|u| u.slot));
     let cbv_slots = slot_bits(used.iter().filter(|u| is_root_cbv(u)).map(|u| u.slot));
     Ok(Translated {
@@ -516,6 +524,58 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Which [`Translated::used`] buffer descriptors a store or atomic instruction
+/// actually writes (ported from `uiliannn/VItoriaBr 6d97bea`).
+/// Matches the instruction's `rsrc`/SMEM base SGPR against `used`'s UAV
+/// `lower_bound`; any dynamic/VGPR or unmatched store sets `write_unknown`.
+#[cfg(windows)]
+fn written_used(
+    program: &victory_shader::NativeProgram,
+    used: &[victory_shader::UsedResource],
+) -> (Vec<bool>, bool) {
+    use victory_shader::gfx10::{Encoding, Fields, Operand, decode};
+    let Ok(code) = decode(&program.code) else {
+        return (vec![true; used.len()], true);
+    };
+    let mut written = vec![false; used.len()];
+    let mut unknown = false;
+    for inst in code.iter() {
+        let is_store = match inst.encoding {
+            Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem => {
+                inst.name().is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+            }
+            Encoding::Sop1 => inst.name().is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        };
+        if !is_store {
+            continue;
+        }
+        let fields = inst.fields(program.wave64);
+        let descriptor = match &fields {
+            Fields::Buffer { rsrc, .. } => Some(rsrc),
+            Fields::Smem { base, .. } => Some(base),
+            _ => None,
+        };
+        let Some(Operand::Scalar { code, .. }) = descriptor else {
+            unknown = true;
+            continue;
+        };
+        let mut hit = false;
+        for (i, resource) in used.iter().enumerate() {
+            if resource.kind == victory_shader::ResourceType::Uav
+                && resource.lower_bound == u32::from(*code)
+            {
+                written[i] = true;
+                hit = true;
+            }
+        }
+        if !hit {
+            unknown = true;
+        }
+    }
+    (written, unknown)
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -624,6 +684,13 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).skipped
 }
 
+/// Whether one of the containers of the title pipeline `this` matches `f`
+/// (false for null). Known at bind time before any host pipeline is built.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -658,6 +725,52 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops
+}
+
+/// Optional per-compute-shader executed/dropped dispatch counter
+/// (`VICTORY_TRACK_DISPATCHES=1`, diagnostics only). Used to measure exact
+/// executed vs skipped dispatch counts for specific compute shaders (e.g. LDS
+/// analysis rejections).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DISPATCH_TRACK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(None);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn track_dispatches_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACK_DISPATCHES").is_some_and(|v| v == "1"))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_dispatch(this: This, executed: bool) {
+    if this.is_null() || !track_dispatches_on() {
+        return;
+    }
+    let p = pipeline(this);
+    let Some(cs) = p.shaders.iter().find(|s| s.stage == "compute") else {
+        return;
+    };
+    let mut map = DISPATCH_TRACK.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_or_insert_with(HashMap::new).entry(cs.hash.clone()).or_default();
+    if executed {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_dispatch_stats() -> Vec<(String, u64, u64)> {
+    if !track_dispatches_on() {
+        return Vec::new();
+    }
+    let map = DISPATCH_TRACK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut out: Vec<(String, u64, u64)> = map
+        .into_iter()
+        .flatten()
+        .map(|(h, (exec, drop))| (h, exec, drop))
+        .collect();
+    out.sort_unstable_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// The stage's container, if it has one.
@@ -923,6 +1036,51 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_marks_only_the_table_descriptor_it_names() {
+        let program = victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: Vec::new(),
+            used: vec![victory_shader::UsedResource {
+                kind: victory_shader::ResourceType::Uav,
+                root: victory_shader::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: [
+                0xE078_1000u32, // buffer_store_dwordx4 v[4:7], v1, s[0:3], 0 offen
+                0x8000_0401,
+                0xBF81_0000, // s_endpgm
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+        };
+        let (written, unknown) = super::written_used(&program, &program.used);
+        assert_eq!(written, [true]);
+        assert!(!unknown);
+
+        let mut load = program;
+        load.code = [0xBF81_0000u32] // s_endpgm
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let (written, unknown) = super::written_used(&load, &load.used);
+        assert_eq!(written, [false]);
+        assert!(!unknown);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

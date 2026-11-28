@@ -38,13 +38,26 @@ struct TableGroup {
     has_uav: bool,
     max_dword: u32,
     entries: Vec<UsedResource>,
+    /// Per-entry flag parallel to `entries`: whether the shader can actually
+    /// store/atomic to this UAV descriptor (`uiliannn/VItoriaBr 6d97bea`).
+    entry_written: Vec<bool>,
     indexed: Vec<RootIndexedView>,
     // Descriptor number -> first declaration, matching the bind-time search.
     by_descriptor: Vec<(u32, usize)>,
 }
 
 impl TablePlan {
+    #[cfg(test)]
     pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+        Self::with_written(used, indexed, &[], true)
+    }
+
+    pub(crate) fn with_written(
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        used_written: &[bool],
+        write_unknown: bool,
+    ) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -60,24 +73,30 @@ impl TablePlan {
                 has_uav: false,
                 max_dword: 0,
                 entries: Vec::new(),
+                entry_written: Vec::new(),
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
             })
             .collect();
         let mut direct = Vec::new();
-        for &u in used.iter().filter(|u| u.root == RootType::Table) {
+        for (idx, &u) in used.iter().enumerate() {
+            if u.root != RootType::Table {
+                continue;
+            }
             let i = slots
                 .binary_search(&u.slot)
                 .expect("table slot collected from these declarations");
             let group = &mut groups[i];
+            let writes = write_unknown || used_written.get(idx).copied().unwrap_or(true);
             group.has_cbv |= u.kind == ResourceType::Cbv;
-            group.has_uav |= u.kind == ResourceType::Uav;
+            group.has_uav |= u.kind == ResourceType::Uav && writes;
             group.max_dword = group.max_dword.max(u.table_offset_dwords);
             direct.push((i, group.entries.len()));
             group
                 .by_descriptor
                 .push((u.table_offset_dwords / 8, group.entries.len()));
             group.entries.push(u);
+            group.entry_written.push(writes);
         }
         for group in &mut groups {
             group.by_descriptor.sort_unstable();
@@ -115,6 +134,15 @@ impl TableGroup {
             .binary_search_by_key(&descriptor, |item| item.0)
             .ok()?;
         Some(&self.entries[self.by_descriptor[i].1])
+    }
+
+    /// Whether descriptor `descriptor` may be written by the shader (true for
+    /// dynamically indexed / unknown entries).
+    fn descriptor_writes(&self, descriptor: u32) -> bool {
+        match self.by_descriptor.binary_search_by_key(&descriptor, |item| item.0) {
+            Ok(i) => self.entry_written[self.by_descriptor[i].1],
+            Err(_) => true,
+        }
     }
 
     fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
@@ -278,6 +306,20 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
 /// permutations beyond `BAKE_PIXEL_SHADERS`.
 const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
+/// Whether `shader` is a program of the title's decoration bake.
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    let h = shader.hash.as_str();
+    BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake ([`State::early_textures`]): written-down lists
+/// (`crate::list::thin`) translate such draws synchronously at the call
+/// (`VICTORY_THIN_BAKE`, default 2).
+pub(crate) fn bake_pipeline(pipeline: This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -360,6 +402,7 @@ const WINDOW_MOST: u64 = 64;
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+        && !crate::drvwatch::tripped()
 }
 
 /// Whether indirect executions whose arguments or count lie in title memory
@@ -836,17 +879,15 @@ impl State {
                 return Some(out);
             }
             self.flush_slab();
-            let (first, got) = host.dynamic_slab(n, DYNAMIC_SLAB).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic_slab(n, DYNAMIC_SLAB)
-            })?;
+            let (first, got) = host
+                .dynamic_slab(n, DYNAMIC_SLAB)
+                .or_else(|| crate::host::wait_for_slots(|| host.dynamic_slab(n, DYNAMIC_SLAB)))?;
             self.slab = Some((heap, host_id, first, got, n));
             return Some(first);
         }
-        let first = host.dynamic(n).or_else(|| {
-            crate::host::settle_for_fence();
-            host.dynamic(n)
-        })?;
+        let first = host
+            .dynamic(n)
+            .or_else(|| crate::host::wait_for_slots(|| host.dynamic(n)))?;
         self.dynamic.push((heap, host_id, first, n));
         Some(first)
     }
@@ -3678,6 +3719,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_dispatch(self.pipeline as This, false);
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -3688,6 +3730,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             count_dropped();
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_dispatch(self.pipeline as This, false);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3695,6 +3739,8 @@ impl State {
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_dispatch(self.pipeline as This, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -4361,7 +4407,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, writes: bool, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -4373,7 +4419,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_with(list, u.kind, &view, writes);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -4454,7 +4500,7 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                self.table_entry(list, &group.entries[e], group.entry_written[e], compute);
             }
         }
         let mut made = Few::default();
@@ -4546,8 +4592,8 @@ impl State {
                         host.slot_tabled(title + k);
                     }
                 }
-                let read_view = |handle, kind, view: &View| {
-                    readable(list, kind, view);
+                let read_view = |handle, kind, view: &View, writes: bool| {
+                    readable_with(list, kind, view, writes);
                     // Another stage may be the first reader of this texture
                     // in the shared snapshot. Mirror its title slot just as
                     // when this stage makes a snapshot of its own.
@@ -4559,10 +4605,14 @@ impl State {
                         host.mirror_after(list, title + k, handle);
                     }
                 };
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for (u, &writes) in entries
+                    .iter()
+                    .zip(&group.entry_written)
+                    .filter(|(u, _)| u.kind != ResourceType::Cbv)
+                {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        read_view(handle, u.kind, &view);
+                        read_view(handle, u.kind, &view, writes);
                     }
                 }
                 for k in selected {
@@ -4573,7 +4623,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        read_view(handle, kind, &view);
+                        read_view(handle, kind, &view, true);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -4650,7 +4700,7 @@ impl State {
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable_with(list, kind, &view, group.descriptor_writes(k));
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -4714,7 +4764,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable_with(list, kind, &view, group.descriptor_writes(k));
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -5609,6 +5659,10 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    readable_with(list, kind, view, true);
+}
+
+fn readable_with(list: &HostList, kind: ResourceType, view: &View, writes: bool) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -5617,8 +5671,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as the title has it.
-            if STORES.get() || !write_skip() {
+            // A shader that cannot store to this buffer leaves the range as the title has it.
+            if (STORES.get() && writes) || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
